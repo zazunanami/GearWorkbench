@@ -61,13 +61,14 @@ class _Shaft3D:
                 moment = moment + np.cross(arm - np.array([xs, 0.0, 0.0]), force)
         return moment[1:]
 
-    def unit_load_integral(self, weight, breaks):
-        """Exact integral of the bending moment times a piecewise linear weight."""
+    def unit_load_integral(self, weight, breaks, flexibility):
+        """Exact integral of M * weight / EI for a piecewise linear weight and a
+        piecewise constant EI; flexibility(x) returns 1/EI inside a piece."""
         cuts = sorted({0.0, self.length, *[p[0] for p in self.points], *breaks})
         total = np.zeros(2)
         for a, b in zip(cuts[:-1], cuts[1:]):
             mid = 0.5 * (a + b)
-            total += (b - a) / 6.0 * (
+            total += (b - a) / 6.0 * flexibility(mid) * (
                 self.bending(a, 1) * weight(a) + 4.0 * self.bending(mid, 1) * weight(mid) + self.bending(b, -1) * weight(b)
             )
         return total
@@ -149,7 +150,11 @@ def test_shaft_loads_match_independent_3d_statics(case) -> None:
         "C": _Shaft3D(geo["LC"], [(geo["x5"], p45 - center_c, on_gear5)], couples),
     }
     gear_xs = {"A": [geo["x2"]], "B": [geo["x3"], geo["x4"]], "C": [geo["x5"]]}
-    diameters = {"A": inputs.shaftADiameterMm, "B": inputs.shaftBDiameterMm, "C": inputs.shaftCDiameterMm}
+    profiles = {
+        "A": (inputs.shaftADiameterMm, inputs.shaftAGearSeatMm, inputs.shaftAGearSeatSpans),
+        "B": (inputs.shaftBDiameterMm, inputs.shaftBGearSeatMm, inputs.shaftBGearSeatSpans),
+        "C": (inputs.shaftCDiameterMm, inputs.shaftCGearSeatMm, inputs.shaftCGearSeatSpans),
+    }
 
     # Shaft speeds and torques from the no-slip condition and equilibrium
     assert math.isclose(abs(omega_b), inputs.stage1Ratio, rel_tol=1e-12)
@@ -167,7 +172,13 @@ def test_shaft_loads_match_independent_3d_statics(case) -> None:
         assert np.allclose(np.abs(radial), np.abs([shaft.r1[1], shaft.r2[1]]), rtol=1e-9, atol=1e-6)
         assert np.allclose(np.abs(tangential), np.abs([shaft.r1[2], shaft.r2[2]]), rtol=1e-9, atol=1e-6)
 
-        ei = inputs.elasticModulusMpa * math.pi * diameters[key] ** 4 / 64.0
+        bearing_seat, gear_seat, spans = profiles[key]
+        shoulders = [p for span in spans for p in span]
+
+        def flexibility(x, bearing_seat=bearing_seat, gear_seat=gear_seat, spans=spans):
+            diameter = gear_seat if any(a < x < b for a, b in spans) else bearing_seat
+            return 64.0 / (inputs.elasticModulusMpa * math.pi * diameter ** 4)
+
         length = shaft.length
         for x0 in gear_xs[key]:
             expected = max(np.hypot(*shaft.bending(x0, -1)), np.hypot(*shaft.bending(x0, 1)))
@@ -176,12 +187,12 @@ def test_shaft_loads_match_independent_3d_statics(case) -> None:
             def unit_load(x, x0=x0):
                 return (1.0 - x0 / length) * x if x <= x0 else x0 * (1.0 - x / length)
 
-            deflection = np.hypot(*shaft.unit_load_integral(unit_load, [x0])) / ei
+            deflection = np.hypot(*shaft.unit_load_integral(unit_load, [x0, *shoulders], flexibility))
             computed = float(np.interp(x0, shaft_data[key]["x_t"], shaft_data[key]["y"]))
             assert math.isclose(computed, deflection, rel_tol=1e-6)
 
-        slope_left = np.hypot(*shaft.unit_load_integral(lambda x: 1.0 - x / length, [])) / ei
-        slope_right = np.hypot(*shaft.unit_load_integral(lambda x: x / length, [])) / ei
+        slope_left = np.hypot(*shaft.unit_load_integral(lambda x: 1.0 - x / length, shoulders, flexibility))
+        slope_right = np.hypot(*shaft.unit_load_integral(lambda x: x / length, shoulders, flexibility))
         assert math.isclose(shaft_data[key]["th"][0], slope_left, rel_tol=1e-6)
         assert math.isclose(shaft_data[key]["th"][-1], slope_right, rel_tol=1e-6)
 
@@ -278,6 +289,32 @@ def test_key_suggestion_follows_din_6885(diameter: float, key: str) -> None:
     assert gui.GearboxWorkbench._keySuggestion(None, diameter) == key
 
 
+def test_uniform_profile_matches_closed_form_beam() -> None:
+    inputs = gui.GearboxInputs(shaftAGearSeatMm=30.0)
+    results, shaft_data = gui.GearboxWorkbench._computeAll(None, inputs)
+    ei = inputs.elasticModulusMpa * math.pi * 30.0 ** 4 / 64.0
+    load = math.hypot(results["mesh23"]["Ft"], results["mesh23"]["Fr"])
+    length = inputs.shaftALengthMm
+    y_gear = float(np.interp(inputs.gear2PosFromAmm, shaft_data["A"]["x_t"], shaft_data["A"]["y"]))
+    assert math.isclose(y_gear, load * length ** 3 / (48.0 * ei), rel_tol=1e-12)
+    assert math.isclose(shaft_data["A"]["th"][0], load * length ** 2 / (16.0 * ei), rel_tol=1e-12)
+
+
+def test_critical_locations_follow_the_stepped_profile() -> None:
+    results, shaft_data = _compute_all()
+    rows = {(shaft, name, x): (d, torque) for shaft, name, x, d, _, torque in gui.criticalLocations(results, shaft_data)}
+    t_a = results["T_a"] * 1000.0
+    t_b = results["T_b"] * 1000.0
+    assert rows[("A", "Coupling seat/keyway", None)] == (28.0, t_a)
+    assert rows[("A", "Bearing A shoulder", 15.0)] == (30.0, t_a)
+    assert rows[("A", "Gear 2 seat/keyway", 100.0)] == (36.0, t_a)
+    assert rows[("A", "Bearing B shoulder", 185.0)] == (30.0, 0.0)
+    assert rows[("B", "Spacer shoulder", 150.0)] == (35.0, t_b)
+    assert rows[("B", "Gear 4 seat/keyway", 300.0)] == (42.0, t_b)
+    assert rows[("B", "Bearing D shoulder", 375.0)] == (35.0, 0.0)
+    assert rows[("C", "Coupling seat/keyway", None)] == (22.0, results["T_c"] * 1000.0)
+
+
 def test_shaft_drawings_follow_the_analysis_geometry() -> None:
     from makelpro.technic_draw import build_demo_shafts
 
@@ -287,6 +324,11 @@ def test_shaft_drawings_follow_the_analysis_geometry() -> None:
         "Shaft B (Intermediate)": (inputs.shaftBLengthMm, [inputs.gear3PosFromCmm, inputs.gear4PosFromCmm]),
         "Shaft C (Output)": (inputs.shaftCLengthMm, [inputs.gear5PosFromEmm]),
     }
+    profiles = {
+        "Shaft A (Input)": (inputs.shaftADiameterMm, inputs.shaftAGearSeatMm, inputs.shaftAGearSeatSpans, inputs.shaftACouplingMm),
+        "Shaft B (Intermediate)": (inputs.shaftBDiameterMm, inputs.shaftBGearSeatMm, inputs.shaftBGearSeatSpans, None),
+        "Shaft C (Output)": (inputs.shaftCDiameterMm, inputs.shaftCGearSeatMm, inputs.shaftCGearSeatSpans, inputs.shaftCCouplingMm),
+    }
     for name, segments, keyways, total, _ in build_demo_shafts():
         starts = np.cumsum([0.0] + [length for length, _, _ in segments])
         bearings = [a + length / 2.0 for a, (length, _, kind) in zip(starts, segments) if kind == "bearing"]
@@ -295,6 +337,25 @@ def test_shaft_drawings_follow_the_analysis_geometry() -> None:
         assert starts[-1] == total
         assert len(bearings) == 2 and bearings[1] - bearings[0] == span
         assert [g - bearings[0] for g in gears] == gear_positions
+
+        # Diameters between the bearing centres follow the stepped analysis profile
+        bearing_seat, gear_seat, spans, coupling = profiles[name]
+        cuts = [0.0, *[p for s in spans for p in s], span]
+        expected_pieces = [
+            (a, b, gear_seat if any(sa <= a and b <= sb for sa, sb in spans) else bearing_seat)
+            for a, b in zip(cuts[:-1], cuts[1:])
+        ]
+        drawn_pieces = []
+        for a, (length, diameter, _) in zip(starts, segments):
+            lo, hi = max(a - bearings[0], 0.0), min(a + length - bearings[0], span)
+            if hi <= lo:
+                continue
+            if drawn_pieces and drawn_pieces[-1][2] == diameter:
+                drawn_pieces[-1] = (drawn_pieces[-1][0], hi, diameter)
+            else:
+                drawn_pieces.append((lo, hi, diameter))
+        assert drawn_pieces == expected_pieces
+        assert [d for _, d, kind in segments if kind == "coupling"] == ([coupling] if coupling else [])
         for key_start, key_length, _ in keyways:
             assert any(
                 kind in ("gear", "coupling") and a <= key_start and key_start + key_length <= a + length
@@ -346,9 +407,12 @@ def test_gui_recompute_highlight_reset_and_results_window(monkeypatch) -> None:
     try:
         fatigue = window.fatigueYieldTable
         rows = {(fatigue.item(r, 0).text(), fatigue.item(r, 1).text()): r for r in range(fatigue.rowCount())}
-        assert fatigue.item(rows[("B", "Bearing C shoulder")], 7).text() == "inf"
-        assert fatigue.item(rows[("A", "Bearing B shoulder")], 7).text() == "inf"
-        assert fatigue.item(rows[("A", "Bearing A shoulder")], 7).text() == "6.08"
+        # Default stepped shafts: coupling seat, shoulders and gear seats all pass
+        assert fatigue.item(rows[("A", "Coupling seat/keyway")], 2).text() == "-"
+        assert fatigue.item(rows[("A", "Coupling seat/keyway")], 9).text() == "3.57"
+        assert ("B", "Spacer shoulder") in rows
+        assert all(fatigue.item(r, c).text() == "OK" for r in range(fatigue.rowCount()) for c in (10, 11))
+        assert [window.finalDesignTable.item(r, 9).text() for r in range(3)] == ["PASS"] * 3
 
         # A stricter target flips bold status cells and changes plain cells, highlighting both
         window.targetFatigueSpin.setValue(10.0)
@@ -363,12 +427,19 @@ def test_gui_recompute_highlight_reset_and_results_window(monkeypatch) -> None:
         assert not final_required.font().bold()
         assert not window.resetButton.isEnabled()
 
-        # The recommended diameter has to meet the target once it is analysed
-        recommended = math.ceil(float(window.finalDesignTable.item(0, 5).text()) * 100.0) / 100.0
-        window.dShaftASpin.setValue(recommended)
+        # The recommended diameters have to meet the target once they are analysed
+        def round_up(value):
+            return math.ceil(value * 100.0) / 100.0 + 0.01
+
+        final = window.finalDesignTable
+        scale = float(final.item(0, 5).text()) / float(final.item(0, 1).text())
+        window.dShaftASpin.setValue(round_up(float(final.item(0, 5).text())))
+        window.dGearSeatASpin.setValue(round_up(float(final.item(0, 6).text())))
+        window.dCouplingASpin.setValue(round_up(window.dCouplingASpin.value() * scale))
         window._recomputeAndRedraw()
-        assert fatigue.item(rows[("A", "Gear 2 seat/keyway")], 10).text() == "OK"
-        assert window.finalDesignTable.item(0, 9).text() == "PASS"
+        shaft_a_rows = [r for (shaft, _), r in rows.items() if shaft == "A"]
+        assert all(fatigue.item(r, 10).text() == "OK" for r in shaft_a_rows)
+        assert final.item(0, 9).text() == "PASS"
 
         window._openResultsWindow()
         tabs = window.resultsDialog.tabs

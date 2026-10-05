@@ -10,7 +10,7 @@ This project is an educational engineering tool. It is not certified for real ma
 - Helical gear mesh force calculations for tangential, radial, and axial loading
 - Axial thrust directions from the helix hands and input rotation, with optional `Fa * r` couples in the shaft analysis
 - Shaft speeds, transmitted power, and pitch-line velocities in the results window
-- Shaft shear, bending moment, deflection, and slope post-processing
+- Stepped shafts (bearing seat, gear seat and coupling seat diameters) for shear, bending moment, deflection, and slope post-processing
 - Fatigue and yield-oriented sizing checks based on DE-Gerber-style screening
 - Included public-safe technical figures and a sanitized portfolio report PDF
 
@@ -77,7 +77,7 @@ This repository includes sanitized academic report materials for portfolio purpo
 
 - The optional `Fa * r` couples follow the selected helix hands and input rotation, but thrust bearings and axial preload are not checked; treat this option as an educational extension, not a validated design standard.
 - Stage ratios are defined as d2/d3 and d4/d5, so the gearbox is a speed increaser: Shaft B turns i1 times and Shaft C i1 x i2 times faster than the input (see the Speeds and Power tab in the results window).
-- Bearings are modelled as simple supports at their centres (spans of 200/400/200 mm), and the stepped-shaft drawings in `docs/figures` follow these spans. The analysis uses one diameter per shaft and does not model the steps, so the final stepped geometry should be checked separately.
+- Bearings are modelled as simple supports at their centres (spans of 200/400/200 mm). The shafts are stepped as in the drawings in `docs/figures`: bearing-seat diameter d, gear-seat diameter D on fixed spans, and coupling seats on Shafts A and C that are checked in torsion only (overhung coupling loads are not modelled). One Kt/Kts pair is used for both keyways and shoulder fillets.
 - The sanitized report PDF was produced with an earlier version of the analysis (before the Shaft B load-direction and DE-Gerber corrections) and the earlier drawing layout. Results from the current GUI and the figures in `docs/figures` supersede it.
 - Deeper numerical validation against standards, references, and production-grade shaft design workflows remains future work.
 - Optional CAD generation helpers are intentionally excluded from this public release to keep installation lighter and avoid unnecessary heavy dependencies.

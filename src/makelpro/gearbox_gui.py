@@ -98,10 +98,22 @@ class GearboxInputs:
     faceWidthBigMm: float = 100.0
     faceWidthSmallMm: float = 80.0
 
-    # Shaft baseline diameters for checks
+    # Stepped shafts (as in the drawings): bearing-seat diameter d (also between the
+    # gears on Shaft B), gear-seat diameter D and the coupling seats of Shafts A and C
     shaftADiameterMm: float = 30.0
-    shaftBDiameterMm: float = 36.0
+    shaftBDiameterMm: float = 35.0
     shaftCDiameterMm: float = 25.0
+    shaftAGearSeatMm: float = 36.0
+    shaftBGearSeatMm: float = 42.0
+    shaftCGearSeatMm: float = 30.0
+    shaftACouplingMm: float = 28.0
+    shaftCCouplingMm: float = 22.0
+
+    # Spans carrying the gear-seat diameter, from the left bearing centre; the gear
+    # seats run up to the bearing shoulders
+    shaftAGearSeatSpans: tuple = ((15.0, 185.0),)
+    shaftBGearSeatSpans: tuple = ((25.0, 150.0), (250.0, 375.0))
+    shaftCGearSeatSpans: tuple = ((25.0, 175.0),)
 
     # Deflection and slope limits
     allowDeflectionMm: float = 0.12
@@ -334,13 +346,16 @@ def buildShearMoment(
     loadsSignedUp: list[tuple[float, float]],
     momentsSigned: list[tuple[float, float]] | None = None,
     stepMm: float = 1.0,
+    breakpoints: list[float] | None = None,
 ):
     if momentsSigned is None:
         momentsSigned = []
 
-    # Every interior load or couple position is sampled twice (just before and just
-    # after it), so shear and moment jumps are represented exactly.
-    jumpPositions = sorted({float(p) for p, _ in [*loadsSignedUp, *momentsSigned] if 0.0 < p < Lmm})
+    # Every interior load or couple position (and any extra breakpoint such as a shaft
+    # shoulder) is sampled twice, just before and just after it, so jumps in shear,
+    # moment or section are represented exactly.
+    positions = [p for p, _ in [*loadsSignedUp, *momentsSigned]] + list(breakpoints or [])
+    jumpPositions = sorted({float(p) for p in positions if 0.0 < p < Lmm})
     count = max(2, int(round(Lmm / stepMm)) + 1)
     x = np.sort(np.concatenate([np.union1d(np.linspace(0.0, Lmm, count), jumpPositions), jumpPositions]))
     afterJump = np.ones(len(x), dtype=bool)
@@ -373,10 +388,68 @@ def resultantMomentAt(shaft: dict, xPos: float) -> float:
     return float(np.interp(xPos, x, shaft["M_res"]))
 
 
+def sectionDiameters(x: np.ndarray, bearingSeatMm: float, gearSeatMm: float, gearSeatSpans) -> np.ndarray:
+    """Shaft diameter at each sample: the gear-seat diameter inside gearSeatSpans and
+    the bearing-seat diameter elsewhere. When two samples share a shoulder position,
+    the first takes the section on its left and the second the one on its right."""
+    diameters = np.full(len(x), float(bearingSeatMm))
+    for k, xk in enumerate(x):
+        probe = xk
+        if k + 1 < len(x) and x[k + 1] == xk:
+            probe = xk - 1e-6
+        elif k > 0 and x[k - 1] == xk:
+            probe = xk + 1e-6
+        if any(a < probe < b for a, b in gearSeatSpans):
+            diameters[k] = float(gearSeatMm)
+    return diameters
+
+
 def transmittedTorqueNmm(xPos: float, torqueNmm: float, span: tuple[float, float]) -> float:
     """Torque at xPos for a shaft that carries torqueNmm only between the span ends."""
     lo, hi = min(span), max(span)
     return torqueNmm if lo - 1e-9 <= xPos <= hi + 1e-9 else 0.0
+
+
+def criticalLocations(results: dict, shaftData: dict) -> list[tuple]:
+    """Sections checked for fatigue and yield as (shaft, location, x, d, Mres, T).
+
+    Gear seats use the gear-seat diameter (keyway), shoulders the smaller of the two
+    diameters (fillet) and coupling seats carry torque only. x is measured from the
+    left bearing centre and is None for an overhung coupling seat."""
+    geo = results["geometry"]
+    torques = {"A": results["T_a"] * 1000.0, "B": results["T_b"] * 1000.0, "C": results["T_c"] * 1000.0}
+    layout = {
+        "A": (geo["LA"], [("Gear 2", geo["x2"])], ("A", "B")),
+        "B": (geo["LB"], [("Gear 3", geo["x3"]), ("Gear 4", geo["x4"])], ("C", "D")),
+        "C": (geo["LC"], [("Gear 5", geo["x5"])], ("E", "F")),
+    }
+    rows = []
+    for key, (length, gears, bearingNames) in layout.items():
+        profile = results["profiles"][key]
+        torque = torques[key]
+        sections = []
+        for gearName, xGear in gears:
+            onGearSeat = any(a <= xGear <= b for a, b in profile["spans"])
+            sections.append((xGear, f"{gearName} seat/keyway", profile["D"] if onGearSeat else profile["d"]))
+        shoulders = sorted({p for span in profile["spans"] for p in span if 0.0 < p < length})
+        for k, xShoulder in enumerate(shoulders):
+            if k == 0:
+                name = f"Bearing {bearingNames[0]} shoulder"
+            elif k == len(shoulders) - 1:
+                name = f"Bearing {bearingNames[1]} shoulder"
+            else:
+                name = "Spacer shoulder"
+            sections.append((xShoulder, name, min(profile["d"], profile["D"])))
+        shaftRows = [
+            (key, name, xPos, dMm, resultantMomentAt(shaftData[key], xPos),
+             transmittedTorqueNmm(xPos, torque, results["torqueSpans"][key]))
+            for xPos, name, dMm in sorted(sections)
+        ]
+        if profile["coupling"]:
+            couplingRow = (key, "Coupling seat/keyway", None, profile["coupling"], 0.0, torque)
+            shaftRows = [couplingRow] + shaftRows if profile["couplingAtLeft"] else shaftRows + [couplingRow]
+        rows.extend(shaftRows)
+    return rows
 
 
 def gearMeshLoads(ftN, frN, faN, pitchRadiusMm, meshSide, isDriver, spinSign, hand):
@@ -404,8 +477,10 @@ def computeDeflectionAndSlope(
     xMm: np.ndarray,
     momentNmm: np.ndarray,
     elasticModulusMpa: float,
-    shaftDiameterMm: float,
+    shaftDiameterMm,
 ):
+    """Deflection and slope of a simply supported shaft. shaftDiameterMm is one
+    diameter or one per sample (stepped shaft, with shoulders sampled on both sides)."""
     xMm = np.asarray(xMm, dtype=float)
     momentNmm = np.asarray(momentNmm, dtype=float)
 
@@ -416,8 +491,8 @@ def computeDeflectionAndSlope(
     if Lmm <= 0:
         return np.zeros_like(xMm), np.zeros_like(xMm)
 
-    I = (math.pi * (shaftDiameterMm ** 4)) / 64.0
-    if I <= 0 or elasticModulusMpa <= 0:
+    I = (math.pi * (np.asarray(shaftDiameterMm, dtype=float) ** 4)) / 64.0
+    if np.any(I <= 0) or elasticModulusMpa <= 0:
         return np.zeros_like(xMm), np.zeros_like(xMm)
 
     kappa = momentNmm / (elasticModulusMpa * I)
@@ -769,27 +844,28 @@ class GearboxWorkbench(QMainWindow):
         self.d4Spin.setSuffix(" mm")
         self.d4Spin.setValue(self.inputs.gear4DiameterMm)
 
-        # Shaft diameters
-        self.dShaftASpin = NoWheelDoubleSpinBox()
-        self.dShaftASpin.setRange(5.0, 300.0)
-        self.dShaftASpin.setDecimals(2)
-        self.dShaftASpin.setSingleStep(1.0)
-        self.dShaftASpin.setSuffix(" mm")
-        self.dShaftASpin.setValue(self.inputs.shaftADiameterMm)
+        # Shaft diameters (stepped shafts)
+        def shaftDiameterSpin(value: float, tooltip: str) -> NoWheelDoubleSpinBox:
+            spin = NoWheelDoubleSpinBox()
+            spin.setRange(5.0, 300.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(1.0)
+            spin.setSuffix(" mm")
+            spin.setValue(value)
+            spin.setToolTip(tooltip)
+            return spin
 
-        self.dShaftBSpin = NoWheelDoubleSpinBox()
-        self.dShaftBSpin.setRange(5.0, 300.0)
-        self.dShaftBSpin.setDecimals(2)
-        self.dShaftBSpin.setSingleStep(1.0)
-        self.dShaftBSpin.setSuffix(" mm")
-        self.dShaftBSpin.setValue(self.inputs.shaftBDiameterMm)
-
-        self.dShaftCSpin = NoWheelDoubleSpinBox()
-        self.dShaftCSpin.setRange(5.0, 300.0)
-        self.dShaftCSpin.setDecimals(2)
-        self.dShaftCSpin.setSingleStep(1.0)
-        self.dShaftCSpin.setSuffix(" mm")
-        self.dShaftCSpin.setValue(self.inputs.shaftCDiameterMm)
+        bearingTip = "Bearing seats (on Shaft B also the section between the gears)"
+        gearTip = "Gear seat, running up to the bearing shoulders as in the drawings"
+        couplingTip = "Overhung coupling seat, checked in torsion"
+        self.dShaftASpin = shaftDiameterSpin(self.inputs.shaftADiameterMm, bearingTip)
+        self.dShaftBSpin = shaftDiameterSpin(self.inputs.shaftBDiameterMm, bearingTip)
+        self.dShaftCSpin = shaftDiameterSpin(self.inputs.shaftCDiameterMm, bearingTip)
+        self.dGearSeatASpin = shaftDiameterSpin(self.inputs.shaftAGearSeatMm, gearTip)
+        self.dGearSeatBSpin = shaftDiameterSpin(self.inputs.shaftBGearSeatMm, gearTip)
+        self.dGearSeatCSpin = shaftDiameterSpin(self.inputs.shaftCGearSeatMm, gearTip)
+        self.dCouplingASpin = shaftDiameterSpin(self.inputs.shaftACouplingMm, couplingTip)
+        self.dCouplingCSpin = shaftDiameterSpin(self.inputs.shaftCCouplingMm, couplingTip)
 
         # Load direction checkbox
         self.oppositeOnShaftB = QCheckBox("Shafts A and C on opposite sides of Shaft B")
@@ -945,10 +1021,15 @@ class GearboxWorkbench(QMainWindow):
         self.inputsLayout.addRow(QLabel("Gear 2 helix hand"), self.gear2HandCombo)
         self.inputsLayout.addRow(QLabel("Gear 4 helix hand"), self.gear4HandCombo)
 
-        self.inputsLayout.addRow(self._divider("Shaft baseline diameters"))
-        self.inputsLayout.addRow(QLabel("Shaft A diameter"), self.dShaftASpin)
-        self.inputsLayout.addRow(QLabel("Shaft B diameter"), self.dShaftBSpin)
-        self.inputsLayout.addRow(QLabel("Shaft C diameter"), self.dShaftCSpin)
+        self.inputsLayout.addRow(self._divider("Shaft diameters (stepped)"))
+        self.inputsLayout.addRow(QLabel("Shaft A bearing seat d"), self.dShaftASpin)
+        self.inputsLayout.addRow(QLabel("Shaft A gear seat D"), self.dGearSeatASpin)
+        self.inputsLayout.addRow(QLabel("Shaft A coupling seat"), self.dCouplingASpin)
+        self.inputsLayout.addRow(QLabel("Shaft B bearing seat d"), self.dShaftBSpin)
+        self.inputsLayout.addRow(QLabel("Shaft B gear seat D"), self.dGearSeatBSpin)
+        self.inputsLayout.addRow(QLabel("Shaft C bearing seat d"), self.dShaftCSpin)
+        self.inputsLayout.addRow(QLabel("Shaft C gear seat D"), self.dGearSeatCSpin)
+        self.inputsLayout.addRow(QLabel("Shaft C coupling seat"), self.dCouplingCSpin)
 
         self.inputsLayout.addRow(self._divider("Deflection and slope limits"))
         self.inputsLayout.addRow(QLabel("Allow deflection at gears"), self.allowDeflSpin)
@@ -1053,12 +1134,12 @@ class GearboxWorkbench(QMainWindow):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        marinGroup = QGroupBox("Marin factors breakdown (per shaft diameter)")
+        marinGroup = QGroupBox("Marin factors breakdown (per shaft section)")
         marinLayout = QVBoxLayout(marinGroup)
         self.marinTable = QTableWidget()
         self.marinTable.setColumnCount(10) # Added column for surface finish name
         self.marinTable.setHorizontalHeaderLabels([
-            "Shaft", "Finish", "d (mm)", "Se' (MPa)", "ka", "kb", "kc", "ke", "k_misc", "Se (MPa)"
+            "Section", "Finish", "d (mm)", "Se' (MPa)", "ka", "kb", "kc", "ke", "k_misc", "Se (MPa)"
         ])
         _optimizeTableLayout(self.marinTable)
         marinLayout.addWidget(self.marinTable)
@@ -1146,7 +1227,7 @@ class GearboxWorkbench(QMainWindow):
         intro = QLabel(
             "<b>Final Shaft Design</b><br>"
             "Select shaft diameters, fillet radii, shoulders, key sizes and groove locations.<br>"
-            "If deflection or stress limits are exceeded, the tool suggests a larger diameter." 
+            "If deflection or stress limits are exceeded, the tool suggests larger diameters."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -1157,8 +1238,8 @@ class GearboxWorkbench(QMainWindow):
         self.finalDesignTable.setColumnCount(10)
         self.finalDesignTable.setHorizontalHeaderLabels([
             "Shaft", "d_now\n(mm)", "d_req\n(stress)", "d_req\n(defl)",
-            "d_req\n(slope)", "d_rec\n(mm)", "Fillet r\n(mm)", "Shoulder\nD/d",
-            "Key\nSize", "Status"
+            "d_req\n(slope)", "d_rec\n(mm)", "D_rec\n(mm)", "Fillet r\n(mm)",
+            "Key at\ngear seat", "Status"
         ])
         _optimizeTableLayout(self.finalDesignTable)
         v.addWidget(self.finalDesignTable)
@@ -1166,9 +1247,10 @@ class GearboxWorkbench(QMainWindow):
 
         notes = QLabel(
             "<span style='color:#8b949e'>Notes:</span><br>"
-            "- Fillet radius suggestion: ~3% of diameter.<br>"
-            "- Shoulder D/d: simple 1.2 placeholder (you can adjust in CAD).<br>"
-            "- Key suggestion: DIN 6885-1 parallel key for the shaft diameter.<br>"
+            "- d is the bearing-seat diameter and D the gear-seat diameter. The d_req values scale the "
+            "whole stepped shaft, keeping D/d and the coupling seat in proportion.<br>"
+            "- Fillet radius suggestion: ~3% of d.<br>"
+            "- Key suggestion: DIN 6885-1 parallel key for the gear seat D.<br>"
             "- Groove/relief: place at each shoulder + keyway ends." 
         )
         notes.setWordWrap(True)
@@ -1229,6 +1311,8 @@ class GearboxWorkbench(QMainWindow):
             self.torqueSpin, self.speedSpin, self.phiNSpin, self.psiSpin,
             self.i1Spin, self.i2Spin, self.d2Spin, self.d4Spin,
             self.dShaftASpin, self.dShaftBSpin, self.dShaftCSpin,
+            self.dGearSeatASpin, self.dGearSeatBSpin, self.dGearSeatCSpin,
+            self.dCouplingASpin, self.dCouplingCSpin,
             self.allowDeflSpin, self.allowSlopeSpin,
             self.elasticModulusSpin, self.sutSpin, self.sySpin,
             self.ktSpin, self.ktsSpin, self.qSpin,
@@ -1271,6 +1355,11 @@ class GearboxWorkbench(QMainWindow):
             round(self.dShaftASpin.value(), 6),
             round(self.dShaftBSpin.value(), 6),
             round(self.dShaftCSpin.value(), 6),
+            round(self.dGearSeatASpin.value(), 6),
+            round(self.dGearSeatBSpin.value(), 6),
+            round(self.dGearSeatCSpin.value(), 6),
+            round(self.dCouplingASpin.value(), 6),
+            round(self.dCouplingCSpin.value(), 6),
             round(self.allowDeflSpin.value(), 8),
             round(self.allowSlopeSpin.value(), 10),
             round(self.elasticModulusSpin.value(), 6),
@@ -1319,6 +1408,11 @@ class GearboxWorkbench(QMainWindow):
         i.shaftADiameterMm = max(1.0, self.dShaftASpin.value())
         i.shaftBDiameterMm = max(1.0, self.dShaftBSpin.value())
         i.shaftCDiameterMm = max(1.0, self.dShaftCSpin.value())
+        i.shaftAGearSeatMm = max(1.0, self.dGearSeatASpin.value())
+        i.shaftBGearSeatMm = max(1.0, self.dGearSeatBSpin.value())
+        i.shaftCGearSeatMm = max(1.0, self.dGearSeatCSpin.value())
+        i.shaftACouplingMm = max(1.0, self.dCouplingASpin.value())
+        i.shaftCCouplingMm = max(1.0, self.dCouplingCSpin.value())
 
         i.allowDeflectionMm = max(0.0, self.allowDeflSpin.value())
         i.allowSlopeRad = max(0.0, self.allowSlopeSpin.value())
@@ -1494,8 +1588,9 @@ class GearboxWorkbench(QMainWindow):
         RA_t = multiLoadReactions(LA, loadsA_t)
         RA_r = multiLoadReactions(LA, loadsA_r, momsA_r)
 
-        xA_t, VA_t, MA_t = buildShearMoment(LA, RA_t, loadsA_t)
-        xA_r, VA_r, MA_r = buildShearMoment(LA, RA_r, loadsA_r, momsA_r)
+        shouldersA = [p for span in i.shaftAGearSeatSpans for p in span]
+        xA_t, VA_t, MA_t = buildShearMoment(LA, RA_t, loadsA_t, breakpoints=shouldersA)
+        xA_r, VA_r, MA_r = buildShearMoment(LA, RA_r, loadsA_r, momsA_r, breakpoints=shouldersA)
 
         # Shaft B loads
         loadsB_t, loadsB_r, momsB_r = planeLoads([(x3, gear3), (x4, gear4)])
@@ -1503,8 +1598,9 @@ class GearboxWorkbench(QMainWindow):
         RB_t = multiLoadReactions(LB, loadsB_t)
         RB_r = multiLoadReactions(LB, loadsB_r, momsB_r)
 
-        xB_t, VB_t, MB_t = buildShearMoment(LB, RB_t, loadsB_t)
-        xB_r, VB_r, MB_r = buildShearMoment(LB, RB_r, loadsB_r, momsB_r)
+        shouldersB = [p for span in i.shaftBGearSeatSpans for p in span]
+        xB_t, VB_t, MB_t = buildShearMoment(LB, RB_t, loadsB_t, breakpoints=shouldersB)
+        xB_r, VB_r, MB_r = buildShearMoment(LB, RB_r, loadsB_r, momsB_r, breakpoints=shouldersB)
 
         # Shaft C loads
         loadsC_t, loadsC_r, momsC_r = planeLoads([(x5, gear5)])
@@ -1512,27 +1608,32 @@ class GearboxWorkbench(QMainWindow):
         RC_t = multiLoadReactions(LC, loadsC_t)
         RC_r = multiLoadReactions(LC, loadsC_r, momsC_r)
 
-        xC_t, VC_t, MC_t = buildShearMoment(LC, RC_t, loadsC_t)
-        xC_r, VC_r, MC_r = buildShearMoment(LC, RC_r, loadsC_r, momsC_r)
+        shouldersC = [p for span in i.shaftCGearSeatSpans for p in span]
+        xC_t, VC_t, MC_t = buildShearMoment(LC, RC_t, loadsC_t, breakpoints=shouldersC)
+        xC_r, VC_r, MC_r = buildShearMoment(LC, RC_r, loadsC_r, momsC_r, breakpoints=shouldersC)
 
         # Resultant moments
         MA_res = np.sqrt(MA_t**2 + MA_r**2)
         MB_res = np.sqrt(MB_t**2 + MB_r**2)
         MC_res = np.sqrt(MC_t**2 + MC_r**2)
 
-        # Deflection + slope
-        yA_t, thA_t = computeDeflectionAndSlope(xA_t, MA_t, i.elasticModulusMpa, i.shaftADiameterMm)
-        yA_r, thA_r = computeDeflectionAndSlope(xA_r, MA_r, i.elasticModulusMpa, i.shaftADiameterMm)
+        # Deflection + slope with the stepped sections
+        dA = sectionDiameters(xA_t, i.shaftADiameterMm, i.shaftAGearSeatMm, i.shaftAGearSeatSpans)
+        dB = sectionDiameters(xB_t, i.shaftBDiameterMm, i.shaftBGearSeatMm, i.shaftBGearSeatSpans)
+        dC = sectionDiameters(xC_t, i.shaftCDiameterMm, i.shaftCGearSeatMm, i.shaftCGearSeatSpans)
+
+        yA_t, thA_t = computeDeflectionAndSlope(xA_t, MA_t, i.elasticModulusMpa, dA)
+        yA_r, thA_r = computeDeflectionAndSlope(xA_r, MA_r, i.elasticModulusMpa, dA)
         yA = np.sqrt(yA_t**2 + yA_r**2)
         thA = np.sqrt(thA_t**2 + thA_r**2)
 
-        yB_t, thB_t = computeDeflectionAndSlope(xB_t, MB_t, i.elasticModulusMpa, i.shaftBDiameterMm)
-        yB_r, thB_r = computeDeflectionAndSlope(xB_r, MB_r, i.elasticModulusMpa, i.shaftBDiameterMm)
+        yB_t, thB_t = computeDeflectionAndSlope(xB_t, MB_t, i.elasticModulusMpa, dB)
+        yB_r, thB_r = computeDeflectionAndSlope(xB_r, MB_r, i.elasticModulusMpa, dB)
         yB = np.sqrt(yB_t**2 + yB_r**2)
         thB = np.sqrt(thB_t**2 + thB_r**2)
 
-        yC_t, thC_t = computeDeflectionAndSlope(xC_t, MC_t, i.elasticModulusMpa, i.shaftCDiameterMm)
-        yC_r, thC_r = computeDeflectionAndSlope(xC_r, MC_r, i.elasticModulusMpa, i.shaftCDiameterMm)
+        yC_t, thC_t = computeDeflectionAndSlope(xC_t, MC_t, i.elasticModulusMpa, dC)
+        yC_r, thC_r = computeDeflectionAndSlope(xC_r, MC_r, i.elasticModulusMpa, dC)
         yC = np.sqrt(yC_t**2 + yC_r**2)
         thC = np.sqrt(thC_t**2 + thC_r**2)
 
@@ -1562,6 +1663,14 @@ class GearboxWorkbench(QMainWindow):
                 "A": (0.0 if i.inputCouplingAtLeft else LA, x2),
                 "B": (x3, x4),
                 "C": (x5, LC if i.outputCouplingAtRight else 0.0),
+            },
+            "profiles": {
+                "A": {"d": i.shaftADiameterMm, "D": i.shaftAGearSeatMm, "spans": i.shaftAGearSeatSpans,
+                      "coupling": i.shaftACouplingMm, "couplingAtLeft": i.inputCouplingAtLeft},
+                "B": {"d": i.shaftBDiameterMm, "D": i.shaftBGearSeatMm, "spans": i.shaftBGearSeatSpans,
+                      "coupling": None, "couplingAtLeft": False},
+                "C": {"d": i.shaftCDiameterMm, "D": i.shaftCGearSeatMm, "spans": i.shaftCGearSeatSpans,
+                      "coupling": i.shaftCCouplingMm, "couplingAtLeft": not i.outputCouplingAtRight},
             },
         }
 
@@ -1741,36 +1850,41 @@ class GearboxWorkbench(QMainWindow):
         kfsCalc = 1.0 + i.notchSensQ * (i.ktsTorsion - 1.0)
 
         prev_rows = self.previous_table_state.get("marin", [])
-        
-        # Individual shaft params
-        shafts = [
-            ("A", i.shaftADiameterMm, i.surfaceFinishA),
-            ("B", i.shaftBDiameterMm, i.surfaceFinishB),
-            ("C", i.shaftCDiameterMm, i.surfaceFinishC)
-        ]
 
+        # Map shaft name to surface finish
+        finishMap = {
+            "A": i.surfaceFinishA,
+            "B": i.surfaceFinishB,
+            "C": i.surfaceFinishC
+        }
+
+        # One row per shaft section (bearing seat, gear seat, coupling seat)
         rowsMarin = []
-        for name, d, finish in shafts:
-            mf = correctedEnduranceLimitMpa(
-                sutMpa=i.sutMpa,
-                dMm=d,
-                surfaceFinish=finish,
-                reliability=i.reliability,
-                kLoad=i.loadFactor,
-                kMisc=i.miscFactor,
-            )
-            rowsMarin.append([
-                name,
-                finish,
-                f"{d:.2f}",
-                f"{mf['SePrime']:.1f}",
-                f"{mf['ka']:.3f}",
-                f"{mf['kb']:.3f}",
-                f"{mf['kc']:.3f}",
-                f"{mf['ke']:.3f}",
-                f"{mf['kMisc']:.3f}",
-                f"{mf['Se']:.1f}",
-            ])
+        for name, profile in results["profiles"].items():
+            sections = [("bearing seat", profile["d"]), ("gear seat", profile["D"])]
+            if profile["coupling"]:
+                sections.append(("coupling seat", profile["coupling"]))
+            for sectionName, d in sections:
+                mf = correctedEnduranceLimitMpa(
+                    sutMpa=i.sutMpa,
+                    dMm=d,
+                    surfaceFinish=finishMap[name],
+                    reliability=i.reliability,
+                    kLoad=i.loadFactor,
+                    kMisc=i.miscFactor,
+                )
+                rowsMarin.append([
+                    f"{name} {sectionName}",
+                    finishMap[name],
+                    f"{d:.2f}",
+                    f"{mf['SePrime']:.1f}",
+                    f"{mf['ka']:.3f}",
+                    f"{mf['kb']:.3f}",
+                    f"{mf['kc']:.3f}",
+                    f"{mf['ke']:.3f}",
+                    f"{mf['kMisc']:.3f}",
+                    f"{mf['Se']:.1f}",
+                ])
 
         self.marinTable.setRowCount(len(rowsMarin))
         for r, row in enumerate(rowsMarin):
@@ -1784,36 +1898,8 @@ class GearboxWorkbench(QMainWindow):
         
         self.previous_table_state["marin"] = rowsMarin
 
-        # Critical locations
-        geo = results["geometry"]
-        crit = []
-
-        TA = results["T_a"] * 1000.0
-        TB = results["T_b"] * 1000.0
-        TC = results["T_c"] * 1000.0
-
-        spans = results["torqueSpans"]
-
-        def interpMres(shaftKey: str, xPos: float) -> float:
-            return resultantMomentAt(shaftData[shaftKey], xPos)
-
-        def torqueAt(shaftKey: str, xPos: float, torqueNmm: float) -> float:
-            return transmittedTorqueNmm(xPos, torqueNmm, spans[shaftKey])
-
-        locations = [
-            ("A", "Gear 2 seat/keyway", geo["x2"], i.shaftADiameterMm, TA),
-            ("A", "Bearing A shoulder", 0.0, i.shaftADiameterMm, TA),
-            ("A", "Bearing B shoulder", geo["LA"], i.shaftADiameterMm, TA),
-            ("B", "Gear 3 seat/keyway", geo["x3"], i.shaftBDiameterMm, TB),
-            ("B", "Gear 4 seat/keyway", geo["x4"], i.shaftBDiameterMm, TB),
-            ("B", "Bearing C shoulder", 0.0, i.shaftBDiameterMm, TB),
-            ("B", "Bearing D shoulder", geo["LB"], i.shaftBDiameterMm, TB),
-            ("C", "Gear 5 seat/keyway", geo["x5"], i.shaftCDiameterMm, TC),
-            ("C", "Bearing E shoulder", 0.0, i.shaftCDiameterMm, TC),
-            ("C", "Bearing F shoulder", geo["LC"], i.shaftCDiameterMm, TC),
-        ]
-        for shaftKey, loc, xPos, dMm, tNmm in locations:
-            crit.append((shaftKey, loc, xPos, dMm, interpMres(shaftKey, xPos), torqueAt(shaftKey, xPos, tNmm)))
+        # Critical locations (x is "-" for an overhung coupling seat)
+        crit = criticalLocations(results, shaftData)
 
         prev_crit = self.previous_table_state.get("crit", [])
         self.criticalLocTable.setRowCount(len(crit))
@@ -1822,7 +1908,7 @@ class GearboxWorkbench(QMainWindow):
         for r, row in enumerate(crit):
             row_vals = []
             for c, val in enumerate(row):
-                str_val = str(val)
+                str_val = "-" if val is None else str(val)
                 if isinstance(val, float):
                     if c in (2, 3):
                         str_val = f"{val:.2f}"
@@ -1842,13 +1928,6 @@ class GearboxWorkbench(QMainWindow):
 
         # Fatigue computations
         fatigueRows = []
-        
-        # Map shaft name to surface finish
-        finishMap = {
-            "A": i.surfaceFinishA,
-            "B": i.surfaceFinishB,
-            "C": i.surfaceFinishC
-        }
 
         for (shaftName, loc, xPos, dMm, mRes, tNmm) in crit:
             mf = correctedEnduranceLimitMpa(
@@ -1878,7 +1957,7 @@ class GearboxWorkbench(QMainWindow):
             fatigueRows.append([
                 shaftName,
                 loc,
-                f"{xPos:.1f}",
+                "-" if xPos is None else f"{xPos:.1f}",
                 f"{dMm:.2f}",
                 f"{Se:.1f}",
                 f"{res['sigmaEq_a']:.1f}",
@@ -2007,19 +2086,7 @@ class GearboxWorkbench(QMainWindow):
     def _updateFinalDesign(self, results: dict, shaftData: dict):
         i = self.inputs
         geo = results["geometry"]
-
-        TA = results["T_a"] * 1000.0
-        TB = results["T_b"] * 1000.0
-        TC = results["T_c"] * 1000.0
-
-        def interpMres(shaftKey: str, xPos: float) -> float:
-            return resultantMomentAt(shaftData[shaftKey], xPos)
-
-        shaftCrit = {
-            "A": [(geo["x2"], interpMres("A", geo["x2"]), TA)],
-            "B": [(geo["x3"], interpMres("B", geo["x3"]), TB), (geo["x4"], interpMres("B", geo["x4"]), TB)],
-            "C": [(geo["x5"], interpMres("C", geo["x5"]), TC)],
-        }
+        crit = criticalLocations(results, shaftData)
 
         # Deflection limit applies at the gears (same check as the deflection tab)
         def gearDeflection(shaftKey: str, gearXs: list[float]) -> float:
@@ -2047,22 +2114,25 @@ class GearboxWorkbench(QMainWindow):
         }
 
         rows = []
-        for shaftKey, dNow in [("A", i.shaftADiameterMm), ("B", i.shaftBDiameterMm), ("C", i.shaftCDiameterMm)]:
-            def minSafetyFactors(dTrial: float) -> tuple[float, float]:
-                se = correctedEnduranceLimitMpa(
-                    sutMpa=i.sutMpa,
-                    dMm=dTrial,
-                    surfaceFinish=finishMap[shaftKey],
-                    reliability=i.reliability,
-                    kLoad=i.loadFactor,
-                    kMisc=i.miscFactor,
-                )["Se"]
+        for shaftKey, profile in results["profiles"].items():
+            sections = [row for row in crit if row[0] == shaftKey]
+
+            # Every diameter of the stepped shaft is scaled by the same factor
+            def minSafetyFactors(scale: float) -> tuple[float, float]:
                 nFat = nYield = math.inf
-                for _, mRes, tNmm in shaftCrit[shaftKey]:
+                for _, _, _, dMm, mRes, tNmm in sections:
+                    se = correctedEnduranceLimitMpa(
+                        sutMpa=i.sutMpa,
+                        dMm=dMm * scale,
+                        surfaceFinish=finishMap[shaftKey],
+                        reliability=i.reliability,
+                        kLoad=i.loadFactor,
+                        kMisc=i.miscFactor,
+                    )["Se"]
                     res = equivalentStressDEGerber(
                         MresNmm=mRes,
                         torqueNmm=tNmm,
-                        dMm=dTrial,
+                        dMm=dMm * scale,
                         sutMpa=i.sutMpa,
                         syMpa=i.syMpa,
                         SeMpa=se,
@@ -2073,49 +2143,52 @@ class GearboxWorkbench(QMainWindow):
                     nYield = min(nYield, res["nYield"])
                 return nFat, nYield
 
-            nFatMin, nYMin = minSafetyFactors(dNow)
+            nFatMin, nYMin = minSafetyFactors(1.0)
 
-            dReqStress = dNow
+            scaleStress = 1.0
             if nYMin < i.targetYieldN:
                 # Yield safety factor scales exactly with d^3
-                dReqStress = max(dReqStress, dNow * ((i.targetYieldN / nYMin) ** (1.0 / 3.0)))
+                scaleStress = max(scaleStress, (i.targetYieldN / nYMin) ** (1.0 / 3.0))
             if nFatMin < i.targetFatigueN:
                 # Se drops with d through the size factor kb, so repeat the d^3 scaling
-                dFat, nFat = dNow, nFatMin
+                scaleFat, nFat = 1.0, nFatMin
                 for _ in range(50):
                     if nFat >= i.targetFatigueN * (1.0 - 1e-9):
                         break
-                    dFat *= (i.targetFatigueN / nFat) ** (1.0 / 3.0)
-                    nFat, _ = minSafetyFactors(dFat)
-                dReqStress = max(dReqStress, dFat)
+                    scaleFat *= (i.targetFatigueN / nFat) ** (1.0 / 3.0)
+                    nFat, _ = minSafetyFactors(scaleFat)
+                scaleStress = max(scaleStress, scaleFat)
 
+            # Deflection and slope scale exactly with 1/d^4 when the whole profile scales
             yMax = deflSummary[shaftKey]
             thMax = slopeSummary[shaftKey]
 
-            dReqDefl = dNow
+            scaleDefl = 1.0
             if i.allowDeflectionMm > 0 and yMax > i.allowDeflectionMm:
-                dReqDefl = dNow * ((yMax / i.allowDeflectionMm) ** 0.25)
+                scaleDefl = (yMax / i.allowDeflectionMm) ** 0.25
 
-            dReqSlope = dNow
+            scaleSlope = 1.0
             if i.allowSlopeRad > 0 and thMax > i.allowSlopeRad:
-                dReqSlope = dNow * ((thMax / i.allowSlopeRad) ** 0.25)
+                scaleSlope = (thMax / i.allowSlopeRad) ** 0.25
 
-            dRec = max(dNow, dReqStress, dReqDefl, dReqSlope)
+            scale = max(1.0, scaleStress, scaleDefl, scaleSlope)
+            dNow = profile["d"]
+            dRec = dNow * scale
+            gearSeatRec = profile["D"] * scale
             filletR = 0.03 * dRec
-            shoulderRatio = 1.20
-            keySug = self._keySuggestion(dRec)
+            keySug = self._keySuggestion(gearSeatRec)
 
-            status = "PASS" if (dRec <= dNow + 1e-6) else "INCREASE"
+            status = "PASS" if scale <= 1.0 + 1e-9 else "INCREASE"
 
             rows.append([
                 shaftKey,
                 f"{dNow:.2f}",
-                f"{dReqStress:.2f}",
-                f"{dReqDefl:.2f}",
-                f"{dReqSlope:.2f}",
+                f"{dNow * scaleStress:.2f}",
+                f"{dNow * scaleDefl:.2f}",
+                f"{dNow * scaleSlope:.2f}",
                 f"{dRec:.2f}",
+                f"{gearSeatRec:.2f}",
                 f"{filletR:.2f}",
-                f"{shoulderRatio:.2f}",
                 keySug,
                 status,
             ])
@@ -2215,14 +2288,22 @@ class GearboxWorkbench(QMainWindow):
         })
 
         g = r["geometry"]
+
+        def sections(shaftKey: str) -> str:
+            profile = r["profiles"][shaftKey]
+            text = f"d={profile['d']:.1f}, D={profile['D']:.1f}"
+            if profile["coupling"]:
+                text += f", coupling={profile['coupling']:.1f}"
+            return text
+
         tables.append({
             "tabName": "Geometry",
             "title": "Project geometry used (gear positions from the left bearing centre)",
-            "headers": ["Shaft", "Bearing span\n(mm)", "Gear positions\n(mm)", "Gear diameters\n(mm)", "Ratios"],
+            "headers": ["Shaft", "Bearing span\n(mm)", "Gear positions\n(mm)", "Gear diameters\n(mm)", "Shaft sections\n(mm)", "Ratios"],
             "rows": [
-                ["A", f"{g['LA']:.1f}", f"x2={g['x2']:.1f}", f"d2={r['d2']:.1f}", f"i1={i.stage1Ratio:.2f}"],
-                ["B", f"{g['LB']:.1f}", f"x3={g['x3']:.1f}, x4={g['x4']:.1f}", f"d3={r['d3']:.1f}, d4={r['d4']:.1f}", f"i2={i.stage2Ratio:.2f}"],
-                ["C", f"{g['LC']:.1f}", f"x5={g['x5']:.1f}", f"d5={r['d5']:.1f}", f"Total={i.stage1Ratio*i.stage2Ratio:.2f}"],
+                ["A", f"{g['LA']:.1f}", f"x2={g['x2']:.1f}", f"d2={r['d2']:.1f}", sections("A"), f"i1={i.stage1Ratio:.2f}"],
+                ["B", f"{g['LB']:.1f}", f"x3={g['x3']:.1f}, x4={g['x4']:.1f}", f"d3={r['d3']:.1f}, d4={r['d4']:.1f}", sections("B"), f"i2={i.stage2Ratio:.2f}"],
+                ["C", f"{g['LC']:.1f}", f"x5={g['x5']:.1f}", f"d5={r['d5']:.1f}", sections("C"), f"Total={i.stage1Ratio*i.stage2Ratio:.2f}"],
             ],
         })
 

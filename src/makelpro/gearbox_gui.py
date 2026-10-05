@@ -70,7 +70,8 @@ class GearboxInputs:
     gear2DiameterMm: float = 300.0
     gear4DiameterMm: float = 300.0
 
-    # Shaft geometry (project defaults)
+    # Shaft geometry (project defaults): lengths are bearing-centre spans and gear
+    # positions are measured from the left bearing centre
     shaftALengthMm: float = 200.0
     gear2PosFromAmm: float = 100.0
 
@@ -2216,8 +2217,8 @@ class GearboxWorkbench(QMainWindow):
         g = r["geometry"]
         tables.append({
             "tabName": "Geometry",
-            "title": "Project geometry used", 
-            "headers": ["Shaft", "Length\n(mm)", "Gear positions\n(mm)", "Gear diameters\n(mm)", "Ratios"],
+            "title": "Project geometry used (gear positions from the left bearing centre)",
+            "headers": ["Shaft", "Bearing span\n(mm)", "Gear positions\n(mm)", "Gear diameters\n(mm)", "Ratios"],
             "rows": [
                 ["A", f"{g['LA']:.1f}", f"x2={g['x2']:.1f}", f"d2={r['d2']:.1f}", f"i1={i.stage1Ratio:.2f}"],
                 ["B", f"{g['LB']:.1f}", f"x3={g['x3']:.1f}, x4={g['x4']:.1f}", f"d3={r['d3']:.1f}, d4={r['d4']:.1f}", f"i2={i.stage2Ratio:.2f}"],

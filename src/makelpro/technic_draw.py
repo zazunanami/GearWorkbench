@@ -3,54 +3,65 @@ import matplotlib.patches as patches
 
 
 def build_demo_shafts():
-    """Return the reference shaft definitions used in the release figures."""
+    """Return the reference shaft definitions used in the release figures.
+
+    Bearing seats are centred on the analysis supports (bearing-centre spans of
+    200/400/200 mm) and gear seats on the analysis gear positions. The gear-seat
+    diameter continues up to the bearing so the bearing sits against that shoulder.
+    """
 
     return [
         (
             "Shaft A (Input)",
             [
-                (50, 25, "coupling"),
+                (50, 28, "coupling"),
                 (30, 30, "bearing"),
+                (35, 36, "shoulder"),
                 (100, 36, "gear"),
+                (35, 36, "shoulder"),
                 (30, 30, "bearing"),
             ],
             [
                 (10, 30, 7),
-                (90, 80, 7),
+                (125, 80, 7),
             ],
-            210,
-            "Shaft_A_Technical.png",
+            280,
+            "shaft_a_drawing.png",
         ),
         (
             "Shaft B (Intermediate)",
             [
                 (50, 35, "bearing"),
+                (25, 42, "shoulder"),
                 (100, 42, "gear"),
                 (100, 35, "spacer"),
                 (100, 42, "gear"),
+                (25, 42, "shoulder"),
                 (50, 35, "bearing"),
             ],
             [
-                (60, 80, 8),
-                (260, 80, 8),
+                (85, 80, 8),
+                (285, 80, 8),
             ],
-            400,
-            "Shaft_B_Technical.png",
+            450,
+            "shaft_b_drawing.png",
         ),
         (
             "Shaft C (Output)",
             [
                 (50, 25, "bearing"),
+                (25, 30, "shoulder"),
                 (100, 30, "gear"),
+                (25, 30, "shoulder"),
                 (50, 25, "bearing"),
                 (60, 22, "coupling"),
             ],
             [
-                (60, 80, 7),
-                (210, 40, 7),
+                (85, 80, 7),
+                (260, 40, 7),
             ],
-            260,
-            "Shaft_C_Technical.png",
+            310,
+            "shaft_c_drawing.png",
         ),
     ]
 
@@ -166,40 +177,44 @@ def draw_technical_shaft(shaft_name, segments, keyways, total_len, output_filena
     # Total Length
     draw_arrow(0, dim_base_y - 15, total_len, dim_base_y - 15, f"TOTAL: {total_len}")
 
-    # Diameter Dimensions (Top)
+    # Diameter Dimensions (Top), one label per run of equal diameter
     curr_x_dia = 0
-    for l, d, t in segments:
-        # Diameter text (Centered on segment)
-        mid_seg = curr_x_dia + l/2
-        text_y = d/2 + 5
-        ax.text(mid_seg, text_y, f"Ø{d}", ha='center', va='bottom', fontsize=11, fontweight='bold')
-        
-        # Fillet note (only for specific types)
-        if t in ['gear', 'bearing']:
-            ax.text(curr_x_dia, -d/2 - 5, "r1.5", ha='center', va='top', fontsize=8, color='blue')
-            
+    run_start = 0
+    for idx, (l, d, t) in enumerate(segments):
         curr_x_dia += l
+        if idx == len(segments) - 1 or segments[idx + 1][1] != d:
+            ax.text((run_start + curr_x_dia) / 2, d/2 + 5, f"Ø{d}", ha='center', va='bottom', fontsize=11, fontweight='bold')
+            run_start = curr_x_dia
 
-    # --- 5. Title Block & Info ---
-    # Position the title block at a fixed location in the top-left
-    
-    info_text = (
-        f"PART NAME: {shaft_name.upper()}\n"
-        f"MATERIAL: AISI 4140 Q&T\n"
-        f"UNIT: mm  |  SCALE: 1:1 (Ref)\n"
-        f"--------------------------------\n"
-        f"NOTES:\n"
-        f"1. All unspecified fillets R1.5\n"
-        f"2. Keyways acc. to DIN 6885\n"
-        f"3. General Tolerances: ISO 2768-m"
+    # Fillet note at every shoulder (diameter change)
+    step_x = 0
+    for (l, d, _), (_, d_next, _) in zip(segments[:-1], segments[1:]):
+        step_x += l
+        if d_next != d:
+            ax.text(step_x, -max(d, d_next)/2 - 5, "r=1.5", ha='center', va='top', fontsize=8, color='blue')
+
+    # --- 5. Title Block & Notes ---
+    title_text = (
+        f"SHAFT: {shaft_name.upper()}\n"
+        f"Material: AISI 4140 Q&T\n"
+        f"Unit: mm | Scale: NTS"
     )
-    
-    # Safe positioning for the text box
-    text_box_y = max_d/2 + 30 
-    
-    ax.text(0, text_box_y, info_text, fontsize=12, 
-            verticalalignment='bottom', horizontalalignment='left',
-            bbox=dict(boxstyle='round,pad=0.5', facecolor='#f0f0f0', edgecolor='black', alpha=1))
+    notes_text = (
+        "NOTES:\n"
+        "1. All fillets R1.5 unless noted.\n"
+        "2. Relief grooves at all shoulders.\n"
+        "3. Keyways per DIN 6885.\n"
+        "4. Tolerances: k6 for gears, m6 for bearings."
+    )
+
+    # Safe positioning for the text boxes
+    text_box_y = max_d/2 + 30
+    box_style = dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='black')
+
+    ax.text(0, text_box_y, title_text, fontsize=13,
+            verticalalignment='bottom', horizontalalignment='left', bbox=box_style)
+    ax.text(total_len * 0.6, text_box_y, notes_text, fontsize=11,
+            verticalalignment='bottom', horizontalalignment='left', bbox=box_style)
 
     # Set manual plot limits to ensure everything fits
     ax.set_ylim(-max_d/2 - 40, max_d/2 + 60)

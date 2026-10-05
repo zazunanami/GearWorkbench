@@ -278,6 +278,61 @@ def test_key_suggestion_follows_din_6885(diameter: float, key: str) -> None:
     assert gui.GearboxWorkbench._keySuggestion(None, diameter) == key
 
 
+def test_shaft_drawings_follow_the_analysis_geometry() -> None:
+    from makelpro.technic_draw import build_demo_shafts
+
+    inputs = gui.GearboxInputs()
+    expected = {
+        "Shaft A (Input)": (inputs.shaftALengthMm, [inputs.gear2PosFromAmm]),
+        "Shaft B (Intermediate)": (inputs.shaftBLengthMm, [inputs.gear3PosFromCmm, inputs.gear4PosFromCmm]),
+        "Shaft C (Output)": (inputs.shaftCLengthMm, [inputs.gear5PosFromEmm]),
+    }
+    for name, segments, keyways, total, _ in build_demo_shafts():
+        starts = np.cumsum([0.0] + [length for length, _, _ in segments])
+        bearings = [a + length / 2.0 for a, (length, _, kind) in zip(starts, segments) if kind == "bearing"]
+        gears = [a + length / 2.0 for a, (length, _, kind) in zip(starts, segments) if kind == "gear"]
+        span, gear_positions = expected[name]
+        assert starts[-1] == total
+        assert len(bearings) == 2 and bearings[1] - bearings[0] == span
+        assert [g - bearings[0] for g in gears] == gear_positions
+        for key_start, key_length, _ in keyways:
+            assert any(
+                kind in ("gear", "coupling") and a <= key_start and key_start + key_length <= a + length
+                for a, (length, _, kind) in zip(starts, segments)
+            )
+
+
+def test_free_body_diagrams_match_the_analysis() -> None:
+    from makelpro.fbd import build_demo_cases
+
+    results, _ = _compute_all()
+    geo = results["geometry"]
+    figures = dict(build_demo_cases())
+    tangential, radial = figures["fbd_shaft_b.png"]
+    for panel, plane, forces in (
+        (tangential, "B_t", [results["mesh23"]["Ft"], results["mesh45"]["Ft"]]),
+        (radial, "B_r", [results["mesh23"]["Fr"], results["mesh45"]["Fr"]]),
+    ):
+        _, length, supports, loads = panel
+        assert length == geo["LB"]
+        assert [x for x, _, _ in supports] == [0, length]
+        assert [round(value) for _, _, value in supports] == [round(r) for r in results["reactions"][plane]]
+        assert [x for x, _, _, _ in loads] == [geo["x3"], geo["x4"]]
+        assert [round(value) for _, _, value, _ in loads] == [round(f) for f in forces]
+    # Opposite-sides layout: tangential loads act together, radial loads oppose
+    assert [down for _, _, _, down in tangential[3]] == [True, True]
+    assert [down for _, _, _, down in radial[3]] == [True, False]
+
+    # Single-gear shafts use the resultant of both planes
+    for name, ft, fr in (
+        ("fbd_shaft_a.png", results["mesh23"]["Ft"], results["mesh23"]["Fr"]),
+        ("fbd_shaft_c.png", results["mesh45"]["Ft"], results["mesh45"]["Fr"]),
+    ):
+        (_, _, supports, loads), = figures[name]
+        assert abs(loads[0][2] - math.hypot(ft, fr)) < 1.0
+        assert all(abs(value - math.hypot(ft, fr) / 2.0) < 1.0 for _, _, value in supports)
+
+
 def test_gui_recompute_highlight_reset_and_results_window(monkeypatch) -> None:
     from PySide6.QtWidgets import QApplication
 

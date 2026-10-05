@@ -77,8 +77,8 @@ This repository includes sanitized academic report materials for portfolio purpo
 
 - The optional `Fa * r` couples follow the selected helix hands and input rotation, but thrust bearings and axial preload are not checked; treat this option as an educational extension, not a validated design standard.
 - Stage ratios are defined as d2/d3 and d4/d5, so the gearbox is a speed increaser: Shaft B turns i1 times and Shaft C i1 x i2 times faster than the input (see the Speeds and Power tab in the results window).
-- Bearings are modelled as simple supports at the shaft ends (spans of 200/400/200 mm). The stepped-shaft drawings in `docs/figures` place the bearing seats differently, so they illustrate the layout rather than the analysed geometry.
-- The sanitized report PDF and the figures in `docs/` were produced with an earlier version of the analysis (before the Shaft B load-direction and DE-Gerber corrections). Results from the current GUI supersede their numbers.
+- Bearings are modelled as simple supports at their centres (spans of 200/400/200 mm), and the stepped-shaft drawings in `docs/figures` follow these spans. The analysis uses one diameter per shaft and does not model the steps, so the final stepped geometry should be checked separately.
+- The sanitized report PDF was produced with an earlier version of the analysis (before the Shaft B load-direction and DE-Gerber corrections) and the earlier drawing layout. Results from the current GUI and the figures in `docs/figures` supersede it.
 - Deeper numerical validation against standards, references, and production-grade shaft design workflows remains future work.
 - Optional CAD generation helpers are intentionally excluded from this public release to keep installation lighter and avoid unnecessary heavy dependencies.
 

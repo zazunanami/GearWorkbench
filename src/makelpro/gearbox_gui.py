@@ -81,6 +81,18 @@ class GearboxInputs:
     shaftCLengthMm: float = 200.0
     gear5PosFromEmm: float = 100.0
 
+    # Torque path: input coupling at the left end of Shaft A and output coupling at
+    # the right end of Shaft C (as in the shaft drawings)
+    inputCouplingAtLeft: bool = True
+    outputCouplingAtRight: bool = True
+
+    # Layout and helix hands. Gears 3 and 5 take the opposite hand of their mating
+    # gears; the defaults give gears 3 and 4 the same hand so their thrusts oppose.
+    shaftsACOppositeSides: bool = True
+    inputRotation: str = "CW"  # viewed from the left end of the shafts (x = 0)
+    gear2Hand: str = "Right"
+    gear4Hand: str = "Left"
+
     # Face widths (visual only)
     faceWidthBigMm: float = 100.0
     faceWidthSmallMm: float = 80.0
@@ -166,7 +178,9 @@ def _tableItem(text: str, alignCenter: bool = True, highlight: bool = False, bol
     item = QTableWidgetItem(str(text))
     if alignCenter:
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-    
+    # Remember the base weight so clearing a highlight can restore it
+    item.setData(Qt.ItemDataRole.UserRole, bold)
+
     try:
         font = QFont("Segoe UI")
         font.setPointSize(9)
@@ -323,46 +337,66 @@ def buildShearMoment(
     if momentsSigned is None:
         momentsSigned = []
 
-    x = np.arange(0.0, Lmm + stepMm, stepMm)
-    V = np.zeros_like(x)
-    M = np.zeros_like(x)
+    # Every interior load or couple position is sampled twice (just before and just
+    # after it), so shear and moment jumps are represented exactly.
+    jumpPositions = sorted({float(p) for p, _ in [*loadsSignedUp, *momentsSigned] if 0.0 < p < Lmm})
+    count = max(2, int(round(Lmm / stepMm)) + 1)
+    x = np.sort(np.concatenate([np.union1d(np.linspace(0.0, Lmm, count), jumpPositions), jumpPositions]))
+    afterJump = np.ones(len(x), dtype=bool)
+    afterJump[np.flatnonzero(np.diff(x) == 0.0)] = False
 
     Rleft, _ = reactionsUp
-    V[:] = Rleft
-
+    V = np.full_like(x, Rleft)
     for xLoad, Fy in loadsSignedUp:
-        idx = np.where(x >= xLoad)[0]
-        V[idx] += Fy
+        V[(x > xLoad) | ((x == xLoad) & afterJump)] += Fy
 
+    M = np.zeros_like(x)
     currentM = 0.0
     for i in range(1, len(x)):
-        dx = x[i] - x[i - 1]
-        currentM += V[i - 1] * dx
-
-        prevPos = x[i - 1]
-        currPos = x[i]
-        for xMom, mVal in momentsSigned:
+        currentM += V[i - 1] * (x[i] - x[i - 1])
+        if x[i] == x[i - 1]:
             # Couples are CCW-positive (same convention as multiLoadReactions), so a
             # CCW couple makes the sagging-positive internal moment jump down by mVal.
-            if prevPos < xMom <= currPos:
-                currentM -= mVal
-
+            currentM -= sum(mVal for xMom, mVal in momentsSigned if xMom == x[i])
         M[i] = currentM
 
     return x, V, M
 
 
 def resultantMomentAt(shaft: dict, xPos: float) -> float:
-    """Resultant bending moment at xPos, taking the larger side of a couple jump.
+    """Largest resultant bending moment at xPos (both samples of a jump position)."""
+    x = shaft["x_t"]
+    idx = np.flatnonzero(np.abs(x - xPos) < 1e-9)
+    if idx.size:
+        return float(np.max(shaft["M_res"][idx]))
+    return float(np.interp(xPos, x, shaft["M_res"]))
 
-    buildShearMoment stores the value after the jump at a couple location, so the
-    value just before it is recovered by undoing the jump.
+
+def transmittedTorqueNmm(xPos: float, torqueNmm: float, span: tuple[float, float]) -> float:
+    """Torque at xPos for a shaft that carries torqueNmm only between the span ends."""
+    lo, hi = min(span), max(span)
+    return torqueNmm if lo - 1e-9 <= xPos <= hi + 1e-9 else 0.0
+
+
+def gearMeshLoads(ftN, frN, faN, pitchRadiusMm, meshSide, isDriver, spinSign, hand):
+    """Loads applied to a gear by its mate, in a frame with X along the shafts,
+    Y along the line of centers (schematic up) and Z = X x Y.
+
+    meshSide is +1 when the mesh point lies on the +Y side of the gear axis,
+    spinSign is +1 when the shaft spins about +X (right-hand rule) and hand is
+    +1 for a right-hand helix, -1 for a left-hand one. A right-hand tooth line
+    runs along sin(psi) e_theta + cos(psi) e_X; the contact force is normal to
+    it, which gives Fx = -hand * Ft_theta * tan(psi).
+
+    Returns (Fy, Fz, Fx, Mz): radial, tangential and axial forces (N) and the
+    Fa * r couple about Z (N*mm).
     """
-    mT = float(np.interp(xPos, shaft["x_t"], shaft["M_t"]))
-    mRAfter = float(np.interp(xPos, shaft["x_r"], shaft["M_r"]))
-    jump = sum(mVal for xMom, mVal in shaft.get("moms_r", []) if abs(xMom - xPos) < 1e-9)
-    mRBefore = mRAfter + jump
-    return max(math.hypot(mT, mRBefore), math.hypot(mT, mRAfter))
+    ftTheta = (-1.0 if isDriver else 1.0) * spinSign * ftN  # driven gear is pushed along its rotation
+    fy = -meshSide * frN  # separating force points to the gear axis
+    fz = meshSide * ftTheta  # e_theta = meshSide * e_Z at the mesh point
+    fx = -hand * math.copysign(faN, ftTheta)
+    mz = -meshSide * pitchRadiusMm * fx  # (r e_r) x (Fx e_X), about Z
+    return fy, fz, fx, mz
 
 
 def computeDeflectionAndSlope(
@@ -392,8 +426,10 @@ def computeDeflectionAndSlope(
     theta0 = np.zeros_like(xMm)
     theta0[1:] = np.cumsum(0.5 * (kappa[1:] + kappa[:-1]) * dx)
 
+    # Curvature is linear on each interval, so slope is quadratic there and the
+    # end-corrected trapezoid rule integrates it exactly
     y0 = np.zeros_like(xMm)
-    y0[1:] = np.cumsum(0.5 * (theta0[1:] + theta0[:-1]) * dx)
+    y0[1:] = np.cumsum(0.5 * (theta0[1:] + theta0[:-1]) * dx - (kappa[1:] - kappa[:-1]) * dx ** 2 / 12.0)
 
     C1 = -y0[-1] / Lmm
     theta = theta0 + C1
@@ -467,6 +503,12 @@ def equivalentStressDEGerber(MresNmm, torqueNmm, dMm, sutMpa, syMpa, SeMpa, kfBe
     torqueNmm = float(torqueNmm)
     sigmaB_a = (32.0 * abs(MresNmm) * max(1.0, kfBending)) / (math.pi * (dMm ** 3))
     tauM = (16.0 * abs(torqueNmm) * max(1.0, kfsTorsion)) / (math.pi * (dMm ** 3))
+    # Moment diagrams close to round-off (~1e-11 N*mm) at the supports; stresses that
+    # small are zero, so an unloaded section gets an infinite safety factor.
+    if sigmaB_a < 1e-9:
+        sigmaB_a = 0.0
+    if tauM < 1e-9:
+        tauM = 0.0
     sigmaEq_a = sigmaB_a
     sigmaEq_m = math.sqrt(3.0) * tauM
     SeMpa = max(1e-9, float(SeMpa))
@@ -755,11 +797,31 @@ class GearboxWorkbench(QMainWindow):
             "Unchecked: radial forces add, tangential forces oppose.\n"
             "Tangential directions follow from torque balance on Shaft B."
         )
-        self.oppositeOnShaftB.setChecked(True)
-        
+        self.oppositeOnShaftB.setChecked(self.inputs.shaftsACOppositeSides)
+
         # Checkbox for Fa moment
         self.includeAxialMomentBox = QCheckBox("Include overturning moment from axial force (Fa * r)")
-        self.includeAxialMomentBox.setChecked(False)
+        self.includeAxialMomentBox.setChecked(self.inputs.includeAxialMoment)
+
+        # Rotation and helix hands set the axial force directions (Fa * r couples, thrust)
+        self.rotationCombo = NoWheelComboBox()
+        self.rotationCombo.addItems(["CW", "CCW"])
+        self.rotationCombo.setCurrentText(self.inputs.inputRotation)
+        self.rotationCombo.setToolTip("Input shaft rotation viewed from the left end of the shafts (x = 0).")
+
+        hands = ["Right", "Left"]
+        self.gear2HandCombo = NoWheelComboBox()
+        self.gear2HandCombo.addItems(hands)
+        self.gear2HandCombo.setCurrentText(self.inputs.gear2Hand)
+        self.gear2HandCombo.setToolTip("Gear 3 gets the opposite hand.")
+
+        self.gear4HandCombo = NoWheelComboBox()
+        self.gear4HandCombo.addItems(hands)
+        self.gear4HandCombo.setCurrentText(self.inputs.gear4Hand)
+        self.gear4HandCombo.setToolTip(
+            "Gear 5 gets the opposite hand.\n"
+            "Gears 3 and 4 with the same hand make their axial thrusts on Shaft B oppose."
+        )
 
         # Deflection limits
         self.allowDeflSpin = NoWheelDoubleSpinBox()
@@ -878,6 +940,9 @@ class GearboxWorkbench(QMainWindow):
         self.inputsLayout.addRow(QLabel("Gear 4 diameter"), self.d4Spin)
         self.inputsLayout.addRow(self.oppositeOnShaftB)
         self.inputsLayout.addRow(self.includeAxialMomentBox)
+        self.inputsLayout.addRow(QLabel("Input rotation (from x = 0)"), self.rotationCombo)
+        self.inputsLayout.addRow(QLabel("Gear 2 helix hand"), self.gear2HandCombo)
+        self.inputsLayout.addRow(QLabel("Gear 4 helix hand"), self.gear4HandCombo)
 
         self.inputsLayout.addRow(self._divider("Shaft baseline diameters"))
         self.inputsLayout.addRow(QLabel("Shaft A diameter"), self.dShaftASpin)
@@ -1033,7 +1098,7 @@ class GearboxWorkbench(QMainWindow):
 
         intro = QLabel(
             "<b>Deflection and Slope Checks</b><br>"
-            "Checks: deflection at gear locations and slope at bearings (resultant).\n"
+            "Checks: deflection at gear locations and slope at bearings (resultant).<br>"
             "Default limits are editable in the left panel."
         )
         intro.setWordWrap(True)
@@ -1102,7 +1167,7 @@ class GearboxWorkbench(QMainWindow):
             "<span style='color:#8b949e'>Notes:</span><br>"
             "- Fillet radius suggestion: ~3% of diameter.<br>"
             "- Shoulder D/d: simple 1.2 placeholder (you can adjust in CAD).<br>"
-            "- Key suggestion: quick metric mapping by shaft diameter.<br>"
+            "- Key suggestion: DIN 6885-1 parallel key for the shaft diameter.<br>"
             "- Groove/relief: place at each shoulder + keyway ends." 
         )
         notes.setWordWrap(True)
@@ -1125,6 +1190,7 @@ class GearboxWorkbench(QMainWindow):
             QDoubleSpinBox { background-color: #0b0f15; border: 1px solid #30363d; border-radius: 8px; padding: 6px; min-height: 28px; }
             QComboBox { background-color: #0b0f15; border: 1px solid #30363d; border-radius: 8px; padding: 6px; min-height: 28px; }
             QCheckBox { padding: 4px; }
+            QTableWidget { alternate-background-color: #161b22; }
             QScrollArea { background-color: transparent; }
             QScrollBar:vertical {
                 background: #0d1117;
@@ -1175,6 +1241,9 @@ class GearboxWorkbench(QMainWindow):
         self.finishBCombo.currentIndexChanged.connect(self._markDirty)
         self.finishCCombo.currentIndexChanged.connect(self._markDirty)
         self.reliabilityCombo.currentIndexChanged.connect(self._markDirty)
+        self.rotationCombo.currentIndexChanged.connect(self._markDirty)
+        self.gear2HandCombo.currentIndexChanged.connect(self._markDirty)
+        self.gear4HandCombo.currentIndexChanged.connect(self._markDirty)
         self.oppositeOnShaftB.stateChanged.connect(self._markDirty)
         self.includeAxialMomentBox.stateChanged.connect(self._markDirty)
 
@@ -1219,6 +1288,9 @@ class GearboxWorkbench(QMainWindow):
             round(self.loadFactorSpin.value(), 6),
             bool(self.oppositeOnShaftB.isChecked()),
             bool(self.includeAxialMomentBox.isChecked()),
+            self.rotationCombo.currentText(),
+            self.gear2HandCombo.currentText(),
+            self.gear4HandCombo.currentText(),
         )
         return sig
 
@@ -1270,13 +1342,18 @@ class GearboxWorkbench(QMainWindow):
         i.loadFactor = max(0.2, min(1.0, self.loadFactorSpin.value()))
         
         i.includeAxialMoment = self.includeAxialMomentBox.isChecked()
-        
+        i.shaftsACOppositeSides = self.oppositeOnShaftB.isChecked()
+        i.inputRotation = self.rotationCombo.currentText()
+        i.gear2Hand = self.gear2HandCombo.currentText()
+        i.gear4Hand = self.gear4HandCombo.currentText()
+
         return i
 
     def _recomputeAndRedraw(self):
         try:
-            self.inputs = self._readInputs()
-            results, shaftData = self._computeAll(self.inputs)
+            inputs = self._readInputs()
+            results, shaftData = self._computeAll(inputs)
+            self.inputs = inputs
 
             self.lastResults = results
             self.lastShaftData = shaftData
@@ -1336,10 +1413,10 @@ class GearboxWorkbench(QMainWindow):
                 for c in range(table.columnCount()):
                     item = table.item(r, c)
                     if item:
-                        # Reset to default gray color and normal font weight
-                        item.setForeground(QColor("#c9d1d9")) 
+                        # Reset to default gray color and the cell's base font weight
+                        item.setForeground(QColor("#c9d1d9"))
                         font = item.font()
-                        font.setBold(False)
+                        font.setBold(bool(item.data(Qt.ItemDataRole.UserRole)))
                         item.setFont(font)
         
         # After clearing, disable the button
@@ -1361,7 +1438,13 @@ class GearboxWorkbench(QMainWindow):
         Ft23, Fr23, Fa23, phiT = meshForces(T_a, d2, i.normalPressureAngleDeg, i.helixAngleDeg)
         Ft45, Fr45, Fa45, _ = meshForces(T_b, d4, i.normalPressureAngleDeg, i.helixAngleDeg)
 
-        # Overturning moments
+        # Speeds: each stage drives a smaller gear, so the speed rises by the ratio
+        n_a = i.inputSpeedRpm
+        n_b = n_a * i.stage1Ratio
+        n_c = n_b * i.stage2Ratio
+        powerKw = T_a * 2.0 * math.pi * n_a / 60.0 / 1000.0
+
+        # Overturning moment magnitudes Fa * r (signs come from gearMeshLoads)
         moment_factor = 1.0 if i.includeAxialMoment else 0.0
         Mover2 = (Fa23 * (d2 / 2.0)) * moment_factor
         Mover3 = (Fa23 * (d3 / 2.0)) * moment_factor
@@ -1378,12 +1461,34 @@ class GearboxWorkbench(QMainWindow):
         x4 = i.gear4PosFromCmm
         x5 = i.gear5PosFromEmm
 
-        oppose = self.oppositeOnShaftB.isChecked()
+        # Gear loads in one frame: X along the shafts, Y from Shaft B toward Shaft A
+        # (schematic up), Z = X x Y. Neighbouring shafts counter-rotate and mating
+        # gears have opposite hands. With gear 3 driven and gear 4 driving, the
+        # tangential loads on Shaft B come out in torque balance for either layout.
+        spinA = 1.0 if i.inputRotation == "CW" else -1.0  # CW seen from x = 0 is a spin about +X
+        spinB = -spinA
+        spinC = spinA
+        hand2 = 1.0 if i.gear2Hand == "Right" else -1.0
+        hand4 = 1.0 if i.gear4Hand == "Right" else -1.0
+        side45 = -1.0 if i.shaftsACOppositeSides else 1.0  # mesh 4-5 as seen from Shaft B
+
+        gear2 = gearMeshLoads(Ft23, Fr23, Fa23, d2 / 2.0, -1.0, True, spinA, hand2)
+        gear3 = gearMeshLoads(Ft23, Fr23, Fa23, d3 / 2.0, 1.0, False, spinB, -hand2)
+        gear4 = gearMeshLoads(Ft45, Fr45, Fa45, d4 / 2.0, side45, True, spinB, hand4)
+        gear5 = gearMeshLoads(Ft45, Fr45, Fa45, d5 / 2.0, -side45, False, spinC, -hand4)
+
+        def planeLoads(gears):
+            # Each plane is drawn with its first gear load pointing down; flipping a
+            # plane reverses its forces and couples together.
+            signR = -1.0 if gears[0][1][0] > 0.0 else 1.0
+            signT = -1.0 if gears[0][1][1] > 0.0 else 1.0
+            loadsT = [(x, signT * g[1]) for x, g in gears]
+            loadsR = [(x, signR * g[0]) for x, g in gears]
+            momsR = [(x, signR * g[3] * moment_factor) for x, g in gears]
+            return loadsT, loadsR, momsR
 
         # Shaft A loads
-        loadsA_t = [(x2, -Ft23)]
-        loadsA_r = [(x2, -Fr23)]
-        momsA_r = [(x2, -Mover2)]
+        loadsA_t, loadsA_r, momsA_r = planeLoads([(x2, gear2)])
 
         RA_t = multiLoadReactions(LA, loadsA_t)
         RA_r = multiLoadReactions(LA, loadsA_r, momsA_r)
@@ -1392,15 +1497,7 @@ class GearboxWorkbench(QMainWindow):
         xA_r, VA_r, MA_r = buildShearMoment(LA, RA_r, loadsA_r, momsA_r)
 
         # Shaft B loads
-        # Radial (separating) forces point toward the shaft axis, so they oppose when
-        # the two meshes sit on opposite sides of Shaft B. Torque balance
-        # (Ft23 * d3/2 = Ft45 * d4/2) then requires the tangential forces to act in
-        # the same direction; on the same side both relations flip.
-        radialSignStage2 = +1.0 if oppose else -1.0
-        tangentialSignStage2 = -radialSignStage2
-        loadsB_t = [(x3, -Ft23), (x4, tangentialSignStage2 * Ft45)]
-        loadsB_r = [(x3, -Fr23), (x4, radialSignStage2 * Fr45)]
-        momsB_r = [(x3, -Mover3), (x4, radialSignStage2 * Mover4)]
+        loadsB_t, loadsB_r, momsB_r = planeLoads([(x3, gear3), (x4, gear4)])
 
         RB_t = multiLoadReactions(LB, loadsB_t)
         RB_r = multiLoadReactions(LB, loadsB_r, momsB_r)
@@ -1409,9 +1506,7 @@ class GearboxWorkbench(QMainWindow):
         xB_r, VB_r, MB_r = buildShearMoment(LB, RB_r, loadsB_r, momsB_r)
 
         # Shaft C loads
-        loadsC_t = [(x5, -Ft45)]
-        loadsC_r = [(x5, -Fr45)]
-        momsC_r = [(x5, -Mover5)]
+        loadsC_t, loadsC_r, momsC_r = planeLoads([(x5, gear5)])
 
         RC_t = multiLoadReactions(LC, loadsC_t)
         RC_r = multiLoadReactions(LC, loadsC_r, momsC_r)
@@ -1451,14 +1546,28 @@ class GearboxWorkbench(QMainWindow):
             "T_c": T_c,
             "mesh23": {"Ft": Ft23, "Fr": Fr23, "Fa": Fa23, "Mover2": Mover2, "Mover3": Mover3},
             "mesh45": {"Ft": Ft45, "Fr": Fr45, "Fa": Fa45, "Mover4": Mover4, "Mover5": Mover5},
-            "geometry": {"LA": LA, "LB": LB, "LC": LC, "x2": x2, "x3": x3, "x4": x4, "x5": x5},
+            "geometry": {
+                "LA": LA, "LB": LB, "LC": LC, "x2": x2, "x3": x3, "x4": x4, "x5": x5,
+                "oppositeSides": i.shaftsACOppositeSides,
+            },
             "reactions": {"A_t": RA_t, "A_r": RA_r, "B_t": RB_t, "B_r": RB_r, "C_t": RC_t, "C_r": RC_r},
+            "speeds": {"A": n_a, "B": n_b, "C": n_c},
+            "power_kW": powerKw,
+            "pitchLineVelocity": {"23": math.pi * d2 * n_a / 60000.0, "45": math.pi * d4 * n_b / 60000.0},
+            # Axial force on each gear along +X (N)
+            "axial": {"2": gear2[2], "3": gear3[2], "4": gear4[2], "5": gear5[2]},
+            # Shaft span that carries torque, between the coupling (or other gear) and the gear
+            "torqueSpans": {
+                "A": (0.0 if i.inputCouplingAtLeft else LA, x2),
+                "B": (x3, x4),
+                "C": (x5, LC if i.outputCouplingAtRight else 0.0),
+            },
         }
 
         shaftData = {
-            "A": {"x_t": xA_t, "V_t": VA_t, "M_t": MA_t, "x_r": xA_r, "V_r": VA_r, "M_r": MA_r, "M_res": MA_res, "y": yA, "th": thA, "moms_r": momsA_r},
-            "B": {"x_t": xB_t, "V_t": VB_t, "M_t": MB_t, "x_r": xB_r, "V_r": VB_r, "M_r": MB_r, "M_res": MB_res, "y": yB, "th": thB, "moms_r": momsB_r},
-            "C": {"x_t": xC_t, "V_t": VC_t, "M_t": MC_t, "x_r": xC_r, "V_r": VC_r, "M_r": MC_r, "M_res": MC_res, "y": yC, "th": thC, "moms_r": momsC_r},
+            "A": {"x_t": xA_t, "V_t": VA_t, "M_t": MA_t, "x_r": xA_r, "V_r": VA_r, "M_r": MA_r, "M_res": MA_res, "y": yA, "th": thA},
+            "B": {"x_t": xB_t, "V_t": VB_t, "M_t": MB_t, "x_r": xB_r, "V_r": VB_r, "M_r": MB_r, "M_res": MB_res, "y": yB, "th": thB},
+            "C": {"x_t": xC_t, "V_t": VC_t, "M_t": MC_t, "x_r": xC_r, "V_r": VC_r, "M_r": MC_r, "M_res": MC_res, "y": yC, "th": thC},
         }
 
         return results, shaftData
@@ -1489,7 +1598,7 @@ class GearboxWorkbench(QMainWindow):
 
         yA = +a23
         yB = 0.0
-        yC = -a45
+        yC = -a45 if geo["oppositeSides"] else a45
 
         colorA = '#58a6ff' 
         colorB = '#f0883e' 
@@ -1558,8 +1667,8 @@ class GearboxWorkbench(QMainWindow):
 
         xMin = min(xA0, xB0, xC0) - 80
         xMax = max(xA0 + LA, xB0 + LB, xC0 + LC) + 80
-        yMin = yC - d4 * 0.7
-        yMax = yA + d2 * 0.7
+        yMin = min(yB, yC) - d4 * 0.7
+        yMax = max(yA, yC) + d2 * 0.7
         ax.set_xlim(xMin, xMax)
         ax.set_ylim(yMin, yMax)
 
@@ -1682,21 +1791,28 @@ class GearboxWorkbench(QMainWindow):
         TB = results["T_b"] * 1000.0
         TC = results["T_c"] * 1000.0
 
+        spans = results["torqueSpans"]
+
         def interpMres(shaftKey: str, xPos: float) -> float:
             return resultantMomentAt(shaftData[shaftKey], xPos)
 
-        crit.append(("A", "Gear 2 seat/keyway", geo["x2"], i.shaftADiameterMm, interpMres("A", geo["x2"]), TA))
-        crit.append(("A", "Bearing A shoulder", 0.0, i.shaftADiameterMm, interpMres("A", 0.0), TA))
-        crit.append(("A", "Bearing B shoulder", geo["LA"], i.shaftADiameterMm, interpMres("A", geo["LA"]), TA))
+        def torqueAt(shaftKey: str, xPos: float, torqueNmm: float) -> float:
+            return transmittedTorqueNmm(xPos, torqueNmm, spans[shaftKey])
 
-        crit.append(("B", "Gear 3 seat/keyway", geo["x3"], i.shaftBDiameterMm, interpMres("B", geo["x3"]), TB))
-        crit.append(("B", "Gear 4 seat/keyway", geo["x4"], i.shaftBDiameterMm, interpMres("B", geo["x4"]), TB))
-        crit.append(("B", "Bearing C shoulder", 0.0, i.shaftBDiameterMm, interpMres("B", 0.0), TB))
-        crit.append(("B", "Bearing D shoulder", geo["LB"], i.shaftBDiameterMm, interpMres("B", geo["LB"]), TB))
-
-        crit.append(("C", "Gear 5 seat/keyway", geo["x5"], i.shaftCDiameterMm, interpMres("C", geo["x5"]), TC))
-        crit.append(("C", "Bearing E shoulder", 0.0, i.shaftCDiameterMm, interpMres("C", 0.0), TC))
-        crit.append(("C", "Bearing F shoulder", geo["LC"], i.shaftCDiameterMm, interpMres("C", geo["LC"]), TC))
+        locations = [
+            ("A", "Gear 2 seat/keyway", geo["x2"], i.shaftADiameterMm, TA),
+            ("A", "Bearing A shoulder", 0.0, i.shaftADiameterMm, TA),
+            ("A", "Bearing B shoulder", geo["LA"], i.shaftADiameterMm, TA),
+            ("B", "Gear 3 seat/keyway", geo["x3"], i.shaftBDiameterMm, TB),
+            ("B", "Gear 4 seat/keyway", geo["x4"], i.shaftBDiameterMm, TB),
+            ("B", "Bearing C shoulder", 0.0, i.shaftBDiameterMm, TB),
+            ("B", "Bearing D shoulder", geo["LB"], i.shaftBDiameterMm, TB),
+            ("C", "Gear 5 seat/keyway", geo["x5"], i.shaftCDiameterMm, TC),
+            ("C", "Bearing E shoulder", 0.0, i.shaftCDiameterMm, TC),
+            ("C", "Bearing F shoulder", geo["LC"], i.shaftCDiameterMm, TC),
+        ]
+        for shaftKey, loc, xPos, dMm, tNmm in locations:
+            crit.append((shaftKey, loc, xPos, dMm, interpMres(shaftKey, xPos), torqueAt(shaftKey, xPos, tNmm)))
 
         prev_crit = self.previous_table_state.get("crit", [])
         self.criticalLocTable.setRowCount(len(crit))
@@ -1871,22 +1987,21 @@ class GearboxWorkbench(QMainWindow):
         plotDeflSlope(self.deflPlotC, self.slopePlotC, "C")
 
     def _keySuggestion(self, dMm: float) -> str:
+        # DIN 6885-1 parallel keys: (largest shaft diameter in mm, b x h)
+        table = [
+            (8, "2x2"), (10, "3x3"), (12, "4x4"), (17, "5x5"), (22, "6x6"), (30, "8x7"),
+            (38, "10x8"), (44, "12x8"), (50, "14x9"), (58, "16x10"), (65, "18x11"), (75, "20x12"),
+            (85, "22x14"), (95, "25x14"), (110, "28x16"), (130, "32x18"), (150, "36x20"),
+            (170, "40x22"), (200, "45x25"), (230, "50x28"), (260, "56x32"), (290, "63x32"),
+            (330, "70x36"), (380, "80x40"), (440, "90x45"), (500, "100x50"),
+        ]
         dMm = float(dMm)
-        if dMm <= 22:
-            return "6x6"
-        if dMm <= 30:
-            return "8x7"
-        if dMm <= 38:
-            return "10x8"
-        if dMm <= 44:
-            return "12x8"
-        if dMm <= 50:
-            return "14x9"
-        if dMm <= 58:
-            return "16x10"
-        if dMm <= 65:
-            return "18x11"
-        return "20x12"
+        if dMm <= 6:
+            return "-"
+        for upperMm, size in table:
+            if dMm <= upperMm:
+                return size
+        return "-"
 
     def _updateFinalDesign(self, results: dict, shaftData: dict):
         i = self.inputs
@@ -1905,10 +2020,15 @@ class GearboxWorkbench(QMainWindow):
             "C": [(geo["x5"], interpMres("C", geo["x5"]), TC)],
         }
 
+        # Deflection limit applies at the gears (same check as the deflection tab)
+        def gearDeflection(shaftKey: str, gearXs: list[float]) -> float:
+            data = shaftData[shaftKey]
+            return max(abs(float(np.interp(gx, data["x_t"], data["y"]))) for gx in gearXs)
+
         deflSummary = {
-            "A": float(np.max(np.abs(shaftData["A"]["y"]))),
-            "B": float(np.max(np.abs(shaftData["B"]["y"]))),
-            "C": float(np.max(np.abs(shaftData["C"]["y"]))),
+            "A": gearDeflection("A", [geo["x2"]]),
+            "B": gearDeflection("B", [geo["x3"], geo["x4"]]),
+            "C": gearDeflection("C", [geo["x5"]]),
         }
         slopeSummary = {
             "A": max(float(abs(shaftData["A"]["th"][0])), float(abs(shaftData["A"]["th"][-1]))),
@@ -1927,38 +2047,46 @@ class GearboxWorkbench(QMainWindow):
 
         rows = []
         for shaftKey, dNow in [("A", i.shaftADiameterMm), ("B", i.shaftBDiameterMm), ("C", i.shaftCDiameterMm)]:
-            nFatMin = 1e9
-            nYMin = 1e9
-
-            mf = correctedEnduranceLimitMpa(
-                sutMpa=i.sutMpa,
-                dMm=dNow,
-                surfaceFinish=finishMap[shaftKey],
-                reliability=i.reliability,
-                kLoad=i.loadFactor,
-                kMisc=i.miscFactor,
-            )
-            Se = mf["Se"]
-
-            for _, mRes, tNmm in shaftCrit[shaftKey]:
-                res = equivalentStressDEGerber(
-                    MresNmm=mRes,
-                    torqueNmm=tNmm,
-                    dMm=dNow,
+            def minSafetyFactors(dTrial: float) -> tuple[float, float]:
+                se = correctedEnduranceLimitMpa(
                     sutMpa=i.sutMpa,
-                    syMpa=i.syMpa,
-                    SeMpa=Se,
-                    kfBending=kfCalc,
-                    kfsTorsion=kfsCalc,
-                )
-                nFatMin = min(nFatMin, res["nFatigue"])
-                nYMin = min(nYMin, res["nYield"])
+                    dMm=dTrial,
+                    surfaceFinish=finishMap[shaftKey],
+                    reliability=i.reliability,
+                    kLoad=i.loadFactor,
+                    kMisc=i.miscFactor,
+                )["Se"]
+                nFat = nYield = math.inf
+                for _, mRes, tNmm in shaftCrit[shaftKey]:
+                    res = equivalentStressDEGerber(
+                        MresNmm=mRes,
+                        torqueNmm=tNmm,
+                        dMm=dTrial,
+                        sutMpa=i.sutMpa,
+                        syMpa=i.syMpa,
+                        SeMpa=se,
+                        kfBending=kfCalc,
+                        kfsTorsion=kfsCalc,
+                    )
+                    nFat = min(nFat, res["nFatigue"])
+                    nYield = min(nYield, res["nYield"])
+                return nFat, nYield
+
+            nFatMin, nYMin = minSafetyFactors(dNow)
 
             dReqStress = dNow
-            if nFatMin < i.targetFatigueN:
-                dReqStress = max(dReqStress, dNow * ((i.targetFatigueN / max(1e-9, nFatMin)) ** (1.0 / 3.0)))
             if nYMin < i.targetYieldN:
-                dReqStress = max(dReqStress, dNow * ((i.targetYieldN / max(1e-9, nYMin)) ** (1.0 / 3.0)))
+                # Yield safety factor scales exactly with d^3
+                dReqStress = max(dReqStress, dNow * ((i.targetYieldN / nYMin) ** (1.0 / 3.0)))
+            if nFatMin < i.targetFatigueN:
+                # Se drops with d through the size factor kb, so repeat the d^3 scaling
+                dFat, nFat = dNow, nFatMin
+                for _ in range(50):
+                    if nFat >= i.targetFatigueN * (1.0 - 1e-9):
+                        break
+                    dFat *= (i.targetFatigueN / nFat) ** (1.0 / 3.0)
+                    nFat, _ = minSafetyFactors(dFat)
+                dReqStress = max(dReqStress, dFat)
 
             yMax = deflSummary[shaftKey]
             thMax = slopeSummary[shaftKey]
@@ -2022,10 +2150,39 @@ class GearboxWorkbench(QMainWindow):
         tables.append({
             "tabName": "Mesh Forces",
             "title": "Helical gear forces (Ft, Fr, Fa) + overturning moment Fa*(d/2)",
-            "headers": ["Mesh", "Driver gear", "d_driver\n(mm)", "Torque\n(Nm)", "Ft (N)", "Fr (N)", "Fa (N)", "Mover\n(Nmm)"],
+            "headers": ["Mesh", "Driver gear", "d_driver\n(mm)", "Torque\n(Nm)", "Pitch-line V\n(m/s)", "Ft (N)", "Fr (N)", "Fa (N)", "Mover\n(Nmm)"],
             "rows": [
-                ["2-3", "2", f"{r['d2']:.2f}", f"{r['T_a']:.2f}", f"{r['mesh23']['Ft']:.2f}", f"{r['mesh23']['Fr']:.2f}", f"{r['mesh23']['Fa']:.2f}", f"{r['mesh23']['Mover2']:.2f}"],
-                ["4-5", "4", f"{r['d4']:.2f}", f"{r['T_b']:.2f}", f"{r['mesh45']['Ft']:.2f}", f"{r['mesh45']['Fr']:.2f}", f"{r['mesh45']['Fa']:.2f}", f"{r['mesh45']['Mover4']:.2f}"],
+                ["2-3", "2", f"{r['d2']:.2f}", f"{r['T_a']:.2f}", f"{r['pitchLineVelocity']['23']:.3f}", f"{r['mesh23']['Ft']:.2f}", f"{r['mesh23']['Fr']:.2f}", f"{r['mesh23']['Fa']:.2f}", f"{r['mesh23']['Mover2']:.2f}"],
+                ["4-5", "4", f"{r['d4']:.2f}", f"{r['T_b']:.2f}", f"{r['pitchLineVelocity']['45']:.3f}", f"{r['mesh45']['Ft']:.2f}", f"{r['mesh45']['Fr']:.2f}", f"{r['mesh45']['Fa']:.2f}", f"{r['mesh45']['Mover4']:.2f}"],
+            ],
+        })
+
+        speeds = r["speeds"]
+        tables.append({
+            "tabName": "Speeds and Power",
+            "title": "Shaft speeds and transmitted power (no losses)",
+            "headers": ["Shaft", "Speed\n(rpm)", "Torque\n(Nm)", "Power\n(kW)"],
+            "rows": [
+                ["A", f"{speeds['A']:.2f}", f"{r['T_a']:.2f}", f"{r['power_kW']:.3f}"],
+                ["B", f"{speeds['B']:.2f}", f"{r['T_b']:.2f}", f"{r['power_kW']:.3f}"],
+                ["C", f"{speeds['C']:.2f}", f"{r['T_c']:.2f}", f"{r['power_kW']:.3f}"],
+            ],
+        })
+
+        axial = r["axial"]
+        oppositeHand = {"Right": "Left", "Left": "Right"}
+        tables.append({
+            "tabName": "Axial Thrust",
+            "title": "Axial gear forces, positive toward +x (away from the x = 0 end)",
+            "headers": ["Shaft", "Gear", "Helix hand", "Fa on gear\n(N)"],
+            "rows": [
+                ["A", "2", i.gear2Hand, f"{axial['2']:.2f}"],
+                ["B", "3", oppositeHand[i.gear2Hand], f"{axial['3']:.2f}"],
+                ["B", "4", i.gear4Hand, f"{axial['4']:.2f}"],
+                ["C", "5", oppositeHand[i.gear4Hand], f"{axial['5']:.2f}"],
+                ["A", "Net", "-", f"{axial['2']:.2f}"],
+                ["B", "Net", "-", f"{axial['3'] + axial['4']:.2f}"],
+                ["C", "Net", "-", f"{axial['5']:.2f}"],
             ],
         })
 

@@ -8,6 +8,8 @@ This project is an educational engineering tool. It is not certified for real ma
 
 - Interactive desktop GUI for input parameters, force summaries, shaft response plots, and design tables
 - Helical gear mesh force calculations for tangential, radial, and axial loading
+- Axial thrust directions from the helix hands and input rotation, with optional `Fa * r` couples in the shaft analysis
+- Shaft speeds, transmitted power, and pitch-line velocities in the results window
 - Shaft shear, bending moment, deflection, and slope post-processing
 - Fatigue and yield-oriented sizing checks based on DE-Gerber-style screening
 - Included public-safe technical figures and a sanitized portfolio report PDF
@@ -73,8 +75,10 @@ This repository includes sanitized academic report materials for portfolio purpo
 
 ## Known Limitations
 
-- The `Fa * r` overturning moment assumption remains an educational simplification and should not be treated as a validated design standard.
-- The ratio convention used in the project should be interpreted carefully; users should confirm whether it matches the reduction or speed-increase convention they expect.
+- The optional `Fa * r` couples follow the selected helix hands and input rotation, but thrust bearings and axial preload are not checked; treat this option as an educational extension, not a validated design standard.
+- Stage ratios are defined as d2/d3 and d4/d5, so the gearbox is a speed increaser: Shaft B turns i1 times and Shaft C i1 x i2 times faster than the input (see the Speeds and Power tab in the results window).
+- Bearings are modelled as simple supports at the shaft ends (spans of 200/400/200 mm). The stepped-shaft drawings in `docs/figures` place the bearing seats differently, so they illustrate the layout rather than the analysed geometry.
+- The sanitized report PDF and the figures in `docs/` were produced with an earlier version of the analysis (before the Shaft B load-direction and DE-Gerber corrections). Results from the current GUI supersede their numbers.
 - Deeper numerical validation against standards, references, and production-grade shaft design workflows remains future work.
 - Optional CAD generation helpers are intentionally excluded from this public release to keep installation lighter and avoid unnecessary heavy dependencies.
 

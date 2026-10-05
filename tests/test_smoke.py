@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import compileall
 import os
+import tomllib
 from pathlib import Path
 
+from makelpro import __version__
 from makelpro.analysis import default_mesh_summary
 
 
@@ -61,6 +63,11 @@ def test_license_and_readme_branding() -> None:
     readme_text = readme_path.read_text(encoding="utf-8")
     assert "Zazu Nanami" in readme_text
     assert "Apache License 2.0" in readme_text
+
+
+def test_package_version_matches_pyproject() -> None:
+    pyproject = tomllib.loads((PUBLIC_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert pyproject["project"]["version"] == __version__
 
 
 def test_sanitized_report_folder_exists() -> None:

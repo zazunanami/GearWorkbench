@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "makelpro-gearbox-workbench"
-version = "1.13.4"
+version = "1.14.0"
 description = "Educational gearbox design GUI and supporting analysis helpers."
 readme = "README.md"
 requires-python = ">=3.12"

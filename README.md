@@ -40,7 +40,7 @@ uv run python -m makelpro.gearbox_gui
 ## Tests
 
 ```bash
-uv run python -m compileall .
+uv run python -m compileall src tests
 uv run pytest -q
 ```
 

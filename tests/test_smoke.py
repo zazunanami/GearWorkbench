@@ -18,8 +18,20 @@ EXPECTED_MODULES = [
 ]
 
 
+# Local tool and cache folders (all gitignored) are never part of the public release.
+LOCAL_ONLY_DIRS = {".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+
+
 def _join(*parts: str) -> str:
     return "".join(parts)
+
+
+def _release_files() -> list[Path]:
+    files = []
+    for dirpath, dirnames, filenames in os.walk(PUBLIC_ROOT):
+        dirnames[:] = [name for name in dirnames if name not in LOCAL_ONLY_DIRS]
+        files.extend(Path(dirpath) / name for name in filenames)
+    return files
 
 
 FORBIDDEN_PATTERNS = [
@@ -58,15 +70,12 @@ def test_sanitized_report_folder_exists() -> None:
 
 
 def test_compileall_passes_for_public_release() -> None:
-    assert compileall.compile_dir(str(PUBLIC_ROOT), quiet=1)
+    for folder in ("src", "tests"):
+        assert compileall.compile_dir(str(PUBLIC_ROOT / folder), quiet=1)
 
 
 def test_no_forbidden_strings_in_public_release() -> None:
-    for path in PUBLIC_ROOT.rglob("*"):
-        if path.is_dir():
-            continue
-        if "__pycache__" in path.parts:
-            continue
+    for path in _release_files():
         data = path.read_bytes()
         lowered = data.lower()
         for pattern in FORBIDDEN_PATTERNS:
@@ -75,12 +84,10 @@ def test_no_forbidden_strings_in_public_release() -> None:
 
 def test_no_disallowed_artifacts_in_public_release() -> None:
     banned_suffixes = {".exe", ".toc", ".pkg", ".pyz"}
-    for path in PUBLIC_ROOT.rglob("*"):
-        parts_lower = {part.lower() for part in path.parts}
+    for path in _release_files():
+        parts_lower = {part.lower() for part in path.relative_to(PUBLIC_ROOT).parts}
         assert "build" not in parts_lower
-        assert ".venv" not in parts_lower
-        if path.is_file():
-            assert path.suffix.lower() not in banned_suffixes
+        assert path.suffix.lower() not in banned_suffixes
 
 
 def test_default_mesh_regression_values() -> None:

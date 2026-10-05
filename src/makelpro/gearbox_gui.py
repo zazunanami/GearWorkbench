@@ -342,12 +342,27 @@ def buildShearMoment(
         prevPos = x[i - 1]
         currPos = x[i]
         for xMom, mVal in momentsSigned:
+            # Couples are CCW-positive (same convention as multiLoadReactions), so a
+            # CCW couple makes the sagging-positive internal moment jump down by mVal.
             if prevPos < xMom <= currPos:
-                currentM += mVal
+                currentM -= mVal
 
         M[i] = currentM
 
     return x, V, M
+
+
+def resultantMomentAt(shaft: dict, xPos: float) -> float:
+    """Resultant bending moment at xPos, taking the larger side of a couple jump.
+
+    buildShearMoment stores the value after the jump at a couple location, so the
+    value just before it is recovered by undoing the jump.
+    """
+    mT = float(np.interp(xPos, shaft["x_t"], shaft["M_t"]))
+    mRAfter = float(np.interp(xPos, shaft["x_r"], shaft["M_r"]))
+    jump = sum(mVal for xMom, mVal in shaft.get("moms_r", []) if abs(xMom - xPos) < 1e-9)
+    mRBefore = mRAfter + jump
+    return max(math.hypot(mT, mRBefore), math.hypot(mT, mRAfter))
 
 
 def computeDeflectionAndSlope(
@@ -456,9 +471,14 @@ def equivalentStressDEGerber(MresNmm, torqueNmm, dMm, sutMpa, syMpa, SeMpa, kfBe
     sigmaEq_m = math.sqrt(3.0) * tauM
     SeMpa = max(1e-9, float(SeMpa))
     sutMpa = max(1e-9, float(sutMpa))
-    nFatigue = 1.0 / ((sigmaEq_a / SeMpa) + ((sigmaEq_m / sutMpa) ** 2))
+    # Gerber: n*sigma_a/Se + (n*sigma_m/Sut)^2 = 1, i.e. a*n^2 + b*n - 1 = 0.
+    # The rationalized positive root also covers a = 0 (n = Se/sigma_a).
+    a = (sigmaEq_m / sutMpa) ** 2
+    b = sigmaEq_a / SeMpa
+    denom = b + math.sqrt(b * b + 4.0 * a)
+    nFatigue = 2.0 / denom if denom > 0.0 else math.inf
     sigmaVM = math.sqrt((sigmaB_a ** 2) + 3.0 * (tauM ** 2))
-    nYield = float(syMpa) / max(1e-9, sigmaVM)
+    nYield = float(syMpa) / sigmaVM if sigmaVM > 0.0 else math.inf
     return {
         "sigmaB_a": sigmaB_a,
         "tauM": tauM,
@@ -729,7 +749,12 @@ class GearboxWorkbench(QMainWindow):
         self.dShaftCSpin.setValue(self.inputs.shaftCDiameterMm)
 
         # Load direction checkbox
-        self.oppositeOnShaftB = QCheckBox("Oppose Stage1/Stage2 tangential & radial on Shaft B")
+        self.oppositeOnShaftB = QCheckBox("Shafts A and C on opposite sides of Shaft B")
+        self.oppositeOnShaftB.setToolTip(
+            "Checked: Stage1/Stage2 radial forces oppose on Shaft B, tangential forces add.\n"
+            "Unchecked: radial forces add, tangential forces oppose.\n"
+            "Tangential directions follow from torque balance on Shaft B."
+        )
         self.oppositeOnShaftB.setChecked(True)
         
         # Checkbox for Fa moment
@@ -1367,10 +1392,15 @@ class GearboxWorkbench(QMainWindow):
         xA_r, VA_r, MA_r = buildShearMoment(LA, RA_r, loadsA_r, momsA_r)
 
         # Shaft B loads
-        signStage2 = +1.0 if oppose else -1.0
-        loadsB_t = [(x3, -Ft23), (x4, signStage2 * Ft45)]
-        loadsB_r = [(x3, -Fr23), (x4, signStage2 * Fr45)]
-        momsB_r = [(x3, -Mover3), (x4, signStage2 * Mover4)]
+        # Radial (separating) forces point toward the shaft axis, so they oppose when
+        # the two meshes sit on opposite sides of Shaft B. Torque balance
+        # (Ft23 * d3/2 = Ft45 * d4/2) then requires the tangential forces to act in
+        # the same direction; on the same side both relations flip.
+        radialSignStage2 = +1.0 if oppose else -1.0
+        tangentialSignStage2 = -radialSignStage2
+        loadsB_t = [(x3, -Ft23), (x4, tangentialSignStage2 * Ft45)]
+        loadsB_r = [(x3, -Fr23), (x4, radialSignStage2 * Fr45)]
+        momsB_r = [(x3, -Mover3), (x4, radialSignStage2 * Mover4)]
 
         RB_t = multiLoadReactions(LB, loadsB_t)
         RB_r = multiLoadReactions(LB, loadsB_r, momsB_r)
@@ -1426,9 +1456,9 @@ class GearboxWorkbench(QMainWindow):
         }
 
         shaftData = {
-            "A": {"x_t": xA_t, "V_t": VA_t, "M_t": MA_t, "x_r": xA_r, "V_r": VA_r, "M_r": MA_r, "M_res": MA_res, "y": yA, "th": thA},
-            "B": {"x_t": xB_t, "V_t": VB_t, "M_t": MB_t, "x_r": xB_r, "V_r": VB_r, "M_r": MB_r, "M_res": MB_res, "y": yB, "th": thB},
-            "C": {"x_t": xC_t, "V_t": VC_t, "M_t": MC_t, "x_r": xC_r, "V_r": VC_r, "M_r": MC_r, "M_res": MC_res, "y": yC, "th": thC},
+            "A": {"x_t": xA_t, "V_t": VA_t, "M_t": MA_t, "x_r": xA_r, "V_r": VA_r, "M_r": MA_r, "M_res": MA_res, "y": yA, "th": thA, "moms_r": momsA_r},
+            "B": {"x_t": xB_t, "V_t": VB_t, "M_t": MB_t, "x_r": xB_r, "V_r": VB_r, "M_r": MB_r, "M_res": MB_res, "y": yB, "th": thB, "moms_r": momsB_r},
+            "C": {"x_t": xC_t, "V_t": VC_t, "M_t": MC_t, "x_r": xC_r, "V_r": VC_r, "M_r": MC_r, "M_res": MC_res, "y": yC, "th": thC, "moms_r": momsC_r},
         }
 
         return results, shaftData
@@ -1653,9 +1683,7 @@ class GearboxWorkbench(QMainWindow):
         TC = results["T_c"] * 1000.0
 
         def interpMres(shaftKey: str, xPos: float) -> float:
-            xArr = shaftData[shaftKey]["x_t"]
-            mRes = shaftData[shaftKey]["M_res"]
-            return float(np.interp(xPos, xArr, mRes))
+            return resultantMomentAt(shaftData[shaftKey], xPos)
 
         crit.append(("A", "Gear 2 seat/keyway", geo["x2"], i.shaftADiameterMm, interpMres("A", geo["x2"]), TA))
         crit.append(("A", "Bearing A shoulder", 0.0, i.shaftADiameterMm, interpMres("A", 0.0), TA))
@@ -1869,9 +1897,7 @@ class GearboxWorkbench(QMainWindow):
         TC = results["T_c"] * 1000.0
 
         def interpMres(shaftKey: str, xPos: float) -> float:
-            xArr = shaftData[shaftKey]["x_t"]
-            mRes = shaftData[shaftKey]["M_res"]
-            return float(np.interp(xPos, xArr, mRes))
+            return resultantMomentAt(shaftData[shaftKey], xPos)
 
         shaftCrit = {
             "A": [(geo["x2"], interpMres("A", geo["x2"]), TA)],
